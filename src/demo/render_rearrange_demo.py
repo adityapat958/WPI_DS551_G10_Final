@@ -144,6 +144,14 @@ def main():
 
     frames = []
 
+    def flush_video():
+        if not frames:
+            print("NO FRAMES to write")
+            return
+        os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+        imageio.mimwrite(args.out, frames, fps=args.fps, quality=8, macro_block_size=1)
+        print(f"WROTE {args.out}  ({len(frames)} frames)")
+
     def render(cam_eye, cam_target, label):
         set_camera(sim, cam_eye, cam_target)
         sim.step_physics(1.0 / args.fps)
@@ -159,44 +167,60 @@ def main():
 
     N_NAV, N_OPEN, N_PICK, N_LIFT = 60, 45, 30, 45
 
-    # Phase 1: navigate
-    for i in range(N_NAV):
-        t = i / (N_NAV - 1)
-        p = mn.Vector3(lerp(approach_start[0], approach_end[0], t),
-                       approach_start[1],
-                       lerp(approach_start[2], approach_end[2], t))
-        place_robot(p)
-        e, tg = cam_for(p, ang=lerp(0.3, 0.9, t))
-        render(e, tg, "1. Navigate to cabinet")
+    try:
+        # Phase 1: navigate
+        for i in range(N_NAV):
+            t = i / (N_NAV - 1)
+            p = mn.Vector3(lerp(approach_start[0], approach_end[0], t),
+                           approach_start[1],
+                           lerp(approach_start[2], approach_end[2], t))
+            place_robot(p)
+            e, tg = cam_for(p, ang=lerp(0.3, 0.9, t))
+            render(e, tg, "1. Navigate to cabinet")
 
-    rp = approach_end
-    # Phase 2: open drawer (+ raise arm)
-    for i in range(N_OPEN):
-        t = i / (N_OPEN - 1)
-        jp = list(drawer.joint_positions)
-        jp[args.drawer_joint] = lerp(0.0, args.open_amt, t)
-        drawer.joint_positions = jp
-        robot.joint_positions = [lerp(tuck[k], reach[k], t) for k in range(len(tuck))]
-        e, tg = cam_for(rp, ang=lerp(0.9, 1.2, t), dist=2.8)
-        render(e, tg, "2. Open drawer")
+        rp = approach_end
+        # Phase 2: open drawer (+ raise arm)
+        for i in range(N_OPEN):
+            t = i / (N_OPEN - 1)
+            jp = list(drawer.joint_positions)
+            if jp:
+                j = min(args.drawer_joint, len(jp) - 1)
+                jp[j] = lerp(0.0, args.open_amt, t)
+                drawer.joint_positions = jp
+            robot.joint_positions = [lerp(tuck[k], reach[k], t) for k in range(len(tuck))]
+            e, tg = cam_for(rp, ang=lerp(0.9, 1.2, t), dist=2.8)
+            render(e, tg, "2. Open drawer")
 
-    # Phase 3: reach + grasp
-    for i in range(N_PICK):
-        e, tg = cam_for(rp, ang=lerp(1.2, 1.5, i / (N_PICK - 1)), dist=2.4)
-        render(e, tg, "3. Pick object")
+        # Phase 3: reach + grasp
+        for i in range(N_PICK):
+            e, tg = cam_for(rp, ang=lerp(1.2, 1.5, i / (N_PICK - 1)), dist=2.4)
+            render(e, tg, "3. Pick object")
 
-    # Phase 4: lift object (can follows gripper)
-    ee_lid = robot.get_link_ids()[-1]
-    for i in range(N_LIFT):
-        t = i / (N_LIFT - 1)
-        gripper = robot.get_link_scene_node(ee_lid).absolute_translation
-        can.translation = mn.Vector3(gripper[0], lerp(drawer_local[1], drawer_local[1] + 0.4, t), gripper[2])
-        e, tg = cam_for(rp, ang=lerp(1.5, 2.1, t), dist=2.6)
-        render(e, tg, "4. Lift & retrieve")
+        # Phase 4: lift object (can follows gripper)
+        try:
+            ee_lid = robot.get_link_ids()[-1]
+        except Exception:
+            ee_lid = None
+        for i in range(N_LIFT):
+            t = i / (N_LIFT - 1)
+            if ee_lid is not None:
+                try:
+                    gripper = robot.get_link_scene_node(ee_lid).absolute_translation
+                    can.translation = mn.Vector3(gripper[0],
+                                                 lerp(drawer_local[1], drawer_local[1] + 0.4, t),
+                                                 gripper[2])
+                except Exception:
+                    can.translation = mn.Vector3(drawer_local[0],
+                                                 lerp(drawer_local[1], drawer_local[1] + 0.4, t),
+                                                 drawer_local[2])
+            e, tg = cam_for(rp, ang=lerp(1.5, 2.1, t), dist=2.6)
+            render(e, tg, "4. Lift & retrieve")
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        print(f"PHASE ERROR (writing partial video): {exc}")
 
-    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-    imageio.mimwrite(args.out, frames, fps=args.fps, quality=8, macro_block_size=1)
-    print(f"WROTE {args.out}  ({len(frames)} frames)")
+    flush_video()
     sim.close()
 
 
