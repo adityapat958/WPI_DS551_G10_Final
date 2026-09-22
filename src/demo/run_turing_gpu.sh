@@ -17,6 +17,8 @@ PY=~/miniconda3/envs/habitat/bin/python
 cd /scratch/apatwardhan/habitat_ws/WPI_DS551_G10_Final
 mkdir -p /scratch/apatwardhan/habitat_ws/habitat_logs videos
 export MAGNUM_LOG=quiet HABITAT_SIM_LOG=quiet
+# glvnd EGL/OpenGL loaders live in the env; make sure they are found on any node
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 
 # --- ensure render deps, keep numpy<2 for habitat_sim ABI ---
 $PY -c "import imageio,cv2,imageio_ffmpeg" 2>/dev/null || \
