@@ -129,8 +129,8 @@ def main():
     ap.add_argument("--drawer-link", default="drawer_topR", help="which drawer link to open")
     ap.add_argument("--open-amt", type=float, default=0.4)
     ap.add_argument("--stand-dist", type=float, default=1.0, help="robot standoff from chest")
-    ap.add_argument("--front-x", type=float, default=1.0, help="chest front axis x")
-    ap.add_argument("--front-z", type=float, default=0.0, help="chest front axis z")
+    ap.add_argument("--front-x", type=float, default=0.0, help="fallback chest front axis x")
+    ap.add_argument("--front-z", type=float, default=1.0, help="fallback chest front axis z")
     ap.add_argument("--cam-dist", type=float, default=2.6)
     args = ap.parse_args()
 
@@ -162,9 +162,25 @@ def main():
         next(iter(djm)) if djm else None)
     dworld = link_world_pos(drawer, drawer_link) if drawer_link else dpos
 
-    # robot stands in front of the chest, facing it
-    front = mn.Vector3(args.front_x, 0.0, args.front_z)  # horizontal front axis
-    fn = front / max(1e-6, front.length())
+    # robot stands in front of the chest, facing it.
+    # auto-detect the drawer's world opening direction by nudging it.
+    def drawer_set(v):
+        if drawer_link and drawer_link in djm:
+            jp = list(drawer.joint_positions)
+            set_joint(drawer, jp, drawer_link, v, djm)
+            drawer.joint_positions = jp
+            sim.step_physics(0.01)
+
+    closed_p = link_world_pos(drawer, drawer_link) if drawer_link else dpos
+    drawer_set(0.2)
+    open_p = link_world_pos(drawer, drawer_link) if drawer_link else dpos
+    drawer_set(0.0)
+    delta = mn.Vector3(open_p[0] - closed_p[0], 0.0, open_p[2] - closed_p[2])
+    if delta.length() < 1e-3:
+        delta = mn.Vector3(args.front_x, 0.0, args.front_z)
+    fn = delta / max(1e-6, delta.length())
+    print("auto front axis:", [round(fn[0], 3), round(fn[2], 3)])
+
     stand = mn.Vector3(dpos[0] + fn[0] * args.stand_dist, dpos[1],
                        dpos[2] + fn[2] * args.stand_dist)
     approach_start = stand + fn * 1.6
@@ -229,6 +245,10 @@ def main():
             jp = list(drawer.joint_positions)
             set_joint(drawer, jp, drawer_link, lerp(0.0, args.open_amt, t), djm)
             drawer.joint_positions = jp
+        # keep the can sitting in the moving drawer
+        dw = link_world_pos(drawer, drawer_link) if drawer_link else dpos
+        if dw is not None:
+            can.translation = mn.Vector3(dw[0], dw[1] + 0.05, dw[2])
 
     try:
         # Phase 1: navigate up to the chest
