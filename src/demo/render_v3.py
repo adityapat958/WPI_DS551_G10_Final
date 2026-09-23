@@ -144,7 +144,7 @@ class Robot:
                 self.q[self.jm[n]] += dist / 0.0613
 
     # --- IK ------------------------------------------------------------------
-    def ik(self, target, axis=None, iters=40, tol=0.004, w_axis=0.25):
+    def ik(self, target, axis=None, iters=60, tol=0.004, w_axis=0.12):
         """DLS IK on the 7 arm joints using the simulator's FK. Returns pos err (m)."""
         target = npv(target)
         ax_t = None if axis is None else npv(V(axis).normalized())
@@ -395,8 +395,8 @@ def main():
         return mn.Vector3(s[0], s[1], s[2]) if not math.isnan(s[0]) else V(p)
 
     floor0 = snap(dc + fn * 1.2)[1]
-    stand_chest = snap(mn.Vector3(handle0[0], floor0, handle0[2]) + fn * 0.78)
-    if (stand_chest - (mn.Vector3(handle0[0], stand_chest[1], handle0[2]) + fn * 0.78)).length() > 0.25:
+    stand_chest = snap(mn.Vector3(handle0[0], floor0, handle0[2]) + fn * 0.66)
+    if (stand_chest - (mn.Vector3(handle0[0], stand_chest[1], handle0[2]) + fn * 0.66)).length() > 0.25:
         warn("chest stand point snapped >25cm")
     # kitchen table: top via ray down, edge toward the robot's approach side
     if table is not None:
@@ -415,7 +415,7 @@ def main():
                 if hh is None or abs(hh.point[1] - top_y) > 0.03:
                     break
                 edge = r
-            cand = mn.Vector3(tc[0], floor0, tc[2]) + d * (edge + 0.62)
+            cand = mn.Vector3(tc[0], floor0, tc[2]) + d * (edge + 0.52)
             if not sim.pathfinder.is_navigable(cand, 0.5):
                 continue
             path = habitat_sim.ShortestPath()
@@ -630,8 +630,9 @@ def main():
             if extra:
                 extra(s)
             tgt = target(s) if callable(target) else p0 + (V(target) - p0) * s
-            err = rb.ik(tgt, axis=axis, iters=25)
+            err = rb.ik(tgt, axis=axis, iters=40)
             st["ik_err"].append(err)
+            st.setdefault("ik_phase", {}).setdefault(caption, []).append(err)
             if fingers is not None:
                 rb.set_fingers(f0 + (fingers - f0) * s)
             rb.look_head(tgt)
@@ -784,6 +785,7 @@ def main():
         ik_err_p95_cm=round(100 * float(np.percentile(st["ik_err"], 95)) if st["ik_err"] else -1, 2),
         **{k: round(v, 3) for k, v in arm_phase.items()},
         render_s=round(time.time() - t_start, 1),
+        ik_p95_cm_by_phase={k: round(100 * float(np.percentile(v, 95)), 1) for k, v in st.get("ik_phase", {}).items()},
         focus_visible_frac={k: round(a / max(1, b), 3) for k, (a, b) in st.get("focus_stats", {}).items()},
     )
     if not args.selftest and table is not None:
