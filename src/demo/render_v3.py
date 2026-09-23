@@ -186,6 +186,31 @@ class Robot:
                 self.q[self.jm[n]] += dist / 0.0613
 
     # --- IK ------------------------------------------------------------------
+    def plan(self, target, axis=None):
+        """global-ish solve: several seeds, many iterations. Returns (q_solution, err); restores q."""
+        q_save = self.q.copy()
+        seeds = [q_save.copy()]
+        ready = q_save.copy()
+        for n, v in zip(ARM, [0.0, -0.4, 0.0, 1.4, 0.0, 0.6, 0.0]):
+            ready[self.jm[n]] = v
+        seeds.append(ready)
+        for _ in range(4):
+            r = q_save.copy()
+            r[self.arm_idx] = np.random.uniform(self.lo[self.arm_idx] * 0.6, self.hi[self.arm_idx] * 0.6)
+            seeds.append(r)
+        best = (None, 1e9)
+        for sd in seeds:
+            self.q = sd.copy()
+            e = self.ik(target, axis=axis, iters=150)
+            # prefer solutions close to the current pose when errors tie
+            cost = e + 0.002 * float(np.linalg.norm(self.q[self.ik_idx] - q_save[self.ik_idx]))
+            if cost < best[1]:
+                best = (self.q.copy(), cost, e)
+            if e < 0.004 and sd is seeds[0]:
+                break
+        self.q = q_save; self.apply()
+        return best[0], best[2]
+
     def ik(self, target, axis=None, iters=60, tol=0.004, w_axis=0.12):
         """DLS IK on the 7 arm joints using the simulator's FK. Returns pos err (m)."""
         target = npv(target)
@@ -482,7 +507,7 @@ def main():
             warn("no navigable table stand; using fallback")
             best = (0, snap(tc + mn.Vector3(0.9, 0, 0)), mn.Vector3(1, 0, 0), 0.4)
         _, stand_table, tdir, tedge = best
-        place_pt = mn.Vector3(tc[0], top_y, tc[2]) + tdir * max(0.0, tedge - 0.18)
+        place_pt = mn.Vector3(tc[0], top_y, tc[2]) + tdir * max(0.0, tedge - 0.10)
         checks.update(table_top_y=round(float(top_y), 3), table_edge_m=round(float(tedge), 3))
         log("table top", round(top_y, 3), "edge", round(tedge, 3), "place", [round(x, 3) for x in place_pt])
     # start: navigable point ~start-dist geodesic from chest stand
@@ -718,12 +743,28 @@ def main():
         st["caption"] = caption
         p0 = rb.tip()
         f0 = rb.q[rb.jm["l_gripper_finger_link"]] if "l_gripper_finger_link" in rb.jm else 0.0
+        q_from = q_to = None
+        if not callable(target):
+            q_from = rb.q.copy()
+            q_to, perr = rb.plan(V(target), axis)
+            st.setdefault("plan_err", {})[caption] = round(100 * perr, 2)
+            if perr > 0.03:
+                warn(f"plan '{caption}' unreachable by {perr*100:.1f} cm")
         for k in range(1, n + 1):
             s = smooth(k / n)
             if extra:
                 extra(s)
-            tgt = target(s) if callable(target) else p0 + (V(target) - p0) * s
-            err = rb.ik(tgt, axis=axis, iters=40)
+            if q_to is not None:
+                keep = [rb.q[rb.jm[nm]] for nm in ("l_gripper_finger_link", "r_gripper_finger_link") if nm in rb.jm]
+                rb.q = q_from + (q_to - q_from) * s
+                for nm, v in zip(("l_gripper_finger_link", "r_gripper_finger_link"), keep):
+                    rb.q[rb.jm[nm]] = v
+                rb.apply()
+                tgt = V(target)
+                err = float((rb.tip() - tgt).length()) if k == n else 0.0
+            else:
+                tgt = target(s)
+                err = rb.ik(tgt, axis=axis, iters=40)
             st["ik_err"].append(err)
             st.setdefault("ik_phase", {}).setdefault(caption, []).append(err)
             if fingers is not None:
@@ -896,6 +937,7 @@ def main():
         render_s=round(time.time() - t_start, 1),
         ik_p95_cm_by_phase={k: round(100 * float(np.percentile(v, 95)), 1) for k, v in st.get("ik_phase", {}).items()},
         hand_depth_valid_frac=round(float(np.mean(st.get("hand_valid", [0]))), 3),
+        plan_err_cm=st.get("plan_err", {}),
         focus_visible_frac={k: round(a / max(1, b), 3) for k, (a, b) in st.get("focus_stats", {}).items()},
     )
     if not args.selftest and table is not None:
