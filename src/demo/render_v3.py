@@ -84,6 +84,7 @@ class Robot:
             if n > 0:
                 self.jm[name] = self.ao.get_link_joint_pos_offset(l)
         self.arm_idx = [self.jm[n] for n in ARM]
+        self.ik_idx = ([self.jm["torso_lift_link"]] if "torso_lift_link" in self.jm else []) + self.arm_idx
         lo, hi = self.ao.joint_position_limits
         self.lo = np.array(lo, dtype=np.float64)
         self.hi = np.array(hi, dtype=np.float64)
@@ -147,7 +148,7 @@ class Robot:
         """DLS IK on the 7 arm joints using the simulator's FK. Returns pos err (m)."""
         target = npv(target)
         ax_t = None if axis is None else npv(V(axis).normalized())
-        idx = self.arm_idx
+        idx = self.ik_idx
         eps = 1e-3
         lam = 0.05
 
@@ -315,18 +316,25 @@ def main():
 
     # handle: ray from 1 m in front of the drawer centre, toward chest
     dc = drawer.T().translation
-    h_hit = raycast(sim, dc + fn * 1.0, -fn, 2.0, ignore=rb.ids)
-    if h_hit is not None and h_hit.object_id in drawer.ids:
-        handle0 = h_hit.point + fn * 0.02
+    hits = []
+    for dy in np.arange(-0.15, 0.35, 0.01):
+        hh = raycast(sim, dc + fn * 1.0 + UP * float(dy), -fn, 2.0, ignore=rb.ids)
+        if hh is not None and hh.object_id in drawer.ids:
+            hits.append(hh.point)
+    if hits:
+        ys = [p_[1] for p_ in hits]
+        mid = hits[int(np.argmin([abs(y - (min(ys) + max(ys)) / 2) for y in ys]))]
+        handle0 = mid + fn * 0.02
+        checks["drawer_front_span_m"] = round(max(ys) - min(ys), 3)
     else:
-        warn("handle ray missed drawer; using link origin")
+        warn("handle rays missed drawer; using link origin")
         handle0 = dc + fn * 0.15
     log("handle point", [round(x, 3) for x in handle0])
 
     # drawer floor (while open) + clearance (while closed) -> choose object
     drawer.set(open_q)
     hw = drawer.T().translation
-    probe = handle0 + fn * open_m - fn * 0.10
+    probe = handle0 + fn * open_m - fn * 0.075
     f_hit = raycast(sim, mn.Vector3(probe[0], handle0[1] + 0.4, probe[2]), -UP, 1.0, ignore=rb.ids)
     floor_y = f_hit.point[1] if (f_hit is not None and f_hit.object_id in drawer.ids) else handle0[1] - 0.05
     if f_hit is None or f_hit.object_id not in drawer.ids:
@@ -342,28 +350,30 @@ def main():
     otm = sim.get_object_template_manager()
     otm.load_configs(YCB_CFG)
     rom = sim.get_rigid_object_manager()
-    can, can_h, obj_name = None, 0.1, None
+    can, can_h, obj_name, can_c = None, 0.1, None, 0.05
     for name in args.objects.split(","):
         hs = otm.get_template_handles(name)
         if not hs:
             continue
         o = rom.add_object_by_template_handle(hs[0])
-        hgt = 0.1
-        for attr in ("collision_shape_aabb", "aabb"):
-            try:
-                bb = getattr(o, attr)
-                hgt = float(bb.size_y()); break
-            except Exception:
-                continue
+        o.motion_type = habitat_sim.physics.MotionType.KINEMATIC
+        air = handle0 + fn * 1.0 + UP * 0.5
+        o.translation = air
+        def first_hit(org, d):
+            ray = habitat_sim.geo.Ray(V(org), V(d))
+            for hh in sim.cast_ray(ray, 2.0).hits:
+                if hh.object_id == o.object_id:
+                    return hh.point[1]
+            return None
+        top = first_hit(air + UP * 0.6, -UP)
+        bot = first_hit(air - UP * 0.6, UP)
+        if top is None or bot is None:
+            warn(f"height rays missed {name}"); hgt, c_off = 0.1, 0.05
         else:
-            try:
-                hgt = float(o.root_scene_node.cumulative_bb.size_y())
-            except Exception:
-                pass
-        if not (0.02 < hgt < 0.4):
-            warn(f"odd object height {hgt}; assuming 0.1"); hgt = 0.1
-        if hgt < clearance - 0.01 or name == args.objects.split(",")[-1]:
-            can, can_h, obj_name = o, hgt, name
+            hgt, c_off = float(top - bot), float(air[1] - bot)
+        log(f"  {name}: height {hgt:.3f} centre-above-bottom {c_off:.3f}")
+        if hgt < clearance - 0.02 or name == args.objects.split(",")[-1]:
+            can, can_h, obj_name, can_c = o, hgt, name, c_off
             break
         rom.remove_object_by_id(o.object_id)
     checks.update(object=obj_name, object_height_m=round(can_h, 3))
@@ -372,7 +382,7 @@ def main():
     can_ids = {can.object_id}
     # can pose relative to drawer link frame (so it rides the drawer)
     drawer.set(drawer.lo)
-    can_local = drawer.T().inverted().transform_point(closed_pt + UP * (can_h / 2 + 0.003))
+    can_local = drawer.T().inverted().transform_point(closed_pt + UP * (can_c + 0.003))
 
     def can_follow_drawer():
         can.translation = drawer.T().transform_point(can_local)
@@ -519,6 +529,18 @@ def main():
                     (255, 255, 255), 1, cv2.LINE_AA)
         return img
 
+    def visible_pt(depth, eye, p, tol=0.35):
+        Tcam = mn.Matrix4.look_at(eye, st["tgt"], UP).inverted()
+        pc = Tcam.transform_point(V(p))
+        if pc[2] >= -0.1:
+            return False
+        dh, dw = depth.shape[:2]
+        f = (dw / 2) / math.tan(hfov / 2)
+        u = int(dw / 2 + f * pc[0] / -pc[2]); v = int(dh / 2 - f * pc[1] / -pc[2])
+        if not (0 <= u < dw and 0 <= v < dh):
+            return False
+        return float(depth[v, u]) > (-pc[2]) - tol
+
     def visible_check(depth, eye):
         """robot torso point projected into the depth image; visible if depth ~ distance."""
         p = rb.pos + UP * 0.75
@@ -552,6 +574,9 @@ def main():
         depth = np.array(obs[0]["depth"])
         st["vis_n"] += 1
         st["vis_ok"] += int(visible_check(depth, eye))
+        for lbl, fp in st.get("focus", {}).items():
+            a = st.setdefault("focus_stats", {}).setdefault(lbl, [0, 0])
+            a[0] += int(visible_pt(depth, eye, fp() if callable(fp) else fp)); a[1] += 1
         img = overlay(img, head)
         if key:
             kp = os.path.join(keydir, f"{len(st['keys']):02d}_{key}.jpg")
@@ -629,8 +654,19 @@ def main():
     rb.set_fingers(0.0)
     rb.apply()
 
-    side = mn.Vector3(-fn[2], 0, fn[0])  # horizontal perpendicular to drawer axis
-    chest_cam = lambda: shot(handle0, fn * 1.9 + side * 1.4 + UP * 0.9, tgt_off=fn * 0.35 - UP * 0.1)
+    def open_side(anchor, perp, along):
+        best, bs = None, -1
+        for sg in (1.0, -1.0):
+            d = (along * 0.8 + perp * sg).normalized()
+            h = raycast(sim, V(anchor) + UP * 0.9, d, 4.0, ignore=rb.ids | can_ids)
+            L = 4.0 if h is None else h.ray_distance
+            if L > bs:
+                best, bs = perp * sg, L
+        return best, bs
+
+    side, side_room = open_side(handle0, mn.Vector3(-fn[2], 0, fn[0]), fn)
+    log("chest cam side room", round(side_room, 2))
+    chest_cam = lambda: shot(handle0, fn * 1.2 + side * 1.7 + UP * 1.0, tgt_off=fn * 0.35 - UP * 0.1)
     arm_phase = {}
     try:
         if args.selftest:
@@ -639,7 +675,8 @@ def main():
             chase(1.0); frame(key="start_chase")
             rb.pos = stand_chest; rb.yaw = math.atan2(fn[2], -fn[0]); rb.apply()
             st["caption"] = "selftest: at chest"
-            shot(handle0, fn * 1.9 + side * 1.4 + UP * 0.9, 1.0, fn * 0.35 - UP * 0.1); frame(key="chest_idle")
+            st["focus"] = {"handle": handle0}
+            shot(handle0, fn * 1.2 + side * 1.7 + UP * 1.0, 1.0, fn * 0.35 - UP * 0.1); frame(key="chest_idle")
             e = rb.ik(handle0, axis=-fn, iters=60)
             checks["selftest_ik_err_handle_m"] = round(e, 4)
             st["caption"] = f"selftest: IK to handle err={e*100:.1f}cm"
@@ -652,8 +689,9 @@ def main():
             if table is not None:
                 rb.pos = stand_table
                 rb.yaw = math.atan2(-(place_pt - stand_table)[2], (place_pt - stand_table)[0]); rb.apply()
-                e3 = rb.ik(place_pt + UP * (can_h / 2 + 0.05), axis=-UP, iters=60)
+                e3 = rb.ik(place_pt + UP * (can_c + 0.05), axis=-UP, iters=60)
                 checks["selftest_ik_err_place_m"] = round(e3, 4)
+                st["focus"] = {"place_target": place_pt}
                 st["caption"] = f"selftest: at kitchen table, IK place err={e3*100:.1f}cm"
                 shot(place_pt, -tdir * 1.6 + mn.Vector3(-tdir[2], 0, tdir[0]) * 1.3 + UP * 1.0, 1.0)
                 frame(key="table_ik_place")
@@ -672,6 +710,8 @@ def main():
         turn(math.atan2(fn[2], -fn[0]), cam=chest_cam)  # face the chest (robot +X = -fn)
         rb.set_torso(0.05)
         # 2. open the drawer by its handle
+        st["focus"] = {"handle": lambda: handle0 + fn * (drawer.get() - drawer.lo) * per_unit,
+                       "object": lambda: can.translation}
         pre = handle0 + fn * 0.12
         reach(pre, -fn, int(1.3 * F), "Reaching for the drawer handle (IK)", chest_cam, fingers=0.045, key="reach_handle")
         reach(handle0, -fn, int(0.5 * F), "Grasping the handle", chest_cam, fingers=0.045)
@@ -702,15 +742,17 @@ def main():
         reach(rb.pos + rb.forward() * 0.45 + UP * 0.85, rb.forward(), int(1.0 * F), "Carry pose", chest_cam,
               held=True, ride=False)
         # 5. carry to the kitchen
+        st["focus"] = {}
         drive(path2, "Carrying the object to the kitchen", held=True, ride=False)
         tyaw = math.atan2(-(place_pt - rb.pos)[2], (place_pt - rb.pos)[0])
-        tside = mn.Vector3(-tdir[2], 0, tdir[0])
+        tside, _ = open_side(place_pt, mn.Vector3(-tdir[2], 0, tdir[0]), -tdir)
         table_cam = lambda: shot(place_pt, -tdir * 1.5 + tside * 1.4 + UP * 1.0, tgt_off=-UP * 0.05)
+        st["focus"] = {"place_target": place_pt, "object": lambda: can.translation}
         turn(tyaw, held=True, ride=False, cam=table_cam)
         # 6. place on the table, release, let physics settle
         above_t = place_pt + UP * (can_h / 2 + 0.12)
         reach(above_t, -UP, int(1.4 * F), "Placing on the kitchen table", table_cam, held=True, ride=False, key="over_table")
-        reach(place_pt + UP * (can_h / 2 + 0.01), -UP, int(0.8 * F), "Placing on the kitchen table", table_cam,
+        reach(place_pt + UP * (can_c + 0.01), -UP, int(0.8 * F), "Placing on the kitchen table", table_cam,
               held=True, ride=False)
         can.motion_type = habitat_sim.physics.MotionType.DYNAMIC
         try:
@@ -742,17 +784,21 @@ def main():
         ik_err_p95_cm=round(100 * float(np.percentile(st["ik_err"], 95)) if st["ik_err"] else -1, 2),
         **{k: round(v, 3) for k, v in arm_phase.items()},
         render_s=round(time.time() - t_start, 1),
+        focus_visible_frac={k: round(a / max(1, b), 3) for k, (a, b) in st.get("focus_stats", {}).items()},
     )
     if not args.selftest and table is not None:
         up_axis = can.rotation.transform_vector(UP)
         checks.update(final_obj_pos=[round(x, 3) for x in cp],
-                      final_obj_height_above_table=round(float(cp[1] - checks["table_top_y"] - can_h / 2), 3),
+                      final_obj_height_above_table=round(float(cp[1] - checks["table_top_y"] - can_c), 3),
                       final_obj_dist_to_target=round(float((mn.Vector3(cp[0], 0, cp[2]) - mn.Vector3(place_pt[0], 0, place_pt[2])).length()), 3),
                       final_obj_tilt_deg=round(math.degrees(math.acos(max(-1, min(1, up_axis[1])))), 1))
         if abs(checks["final_obj_height_above_table"]) > 0.05:
             warn("object did not end on the table top")
     if checks["robot_visible_frac"] < 0.8:
         warn(f"robot visible in only {checks['robot_visible_frac']*100:.0f}% of frames")
+    for k, v in checks["focus_visible_frac"].items():
+        if v < 0.7:
+            warn(f"{k} visible in only {v*100:.0f}% of its shot frames")
     if checks.get("ik_err_p95_cm", 0) > 3:
         warn("IK p95 error > 3 cm (hand not reaching targets)")
 
