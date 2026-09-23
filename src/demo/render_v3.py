@@ -196,7 +196,8 @@ class Robot:
         seeds.append(ready)
         for _ in range(4):
             r = q_save.copy()
-            r[self.arm_idx] = np.random.uniform(self.lo[self.arm_idx] * 0.6, self.hi[self.arm_idx] * 0.6)
+            lo_ = np.clip(self.lo[self.arm_idx], -math.pi, math.pi); hi_ = np.clip(self.hi[self.arm_idx], -math.pi, math.pi)
+            r[self.arm_idx] = np.random.uniform(lo_ * 0.6, hi_ * 0.6)
             seeds.append(r)
         best = (None, 1e9)
         for sd in seeds:
@@ -761,12 +762,13 @@ def main():
                     rb.q[rb.jm[nm]] = v
                 rb.apply()
                 tgt = V(target)
-                err = float((rb.tip() - tgt).length()) if k == n else 0.0
+                err = float((rb.tip() - tgt).length()) if k == n else None
             else:
                 tgt = target(s)
                 err = rb.ik(tgt, axis=axis, iters=40)
-            st["ik_err"].append(err)
-            st.setdefault("ik_phase", {}).setdefault(caption, []).append(err)
+            if err is not None:
+                st["ik_err"].append(err)
+                st.setdefault("ik_phase", {}).setdefault(caption, []).append(err)
             if fingers is not None:
                 rb.set_fingers(f0 + (fingers - f0) * s)
             rb.look_head(tgt)
