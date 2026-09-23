@@ -770,7 +770,7 @@ def main():
             a = k / (3.0 * F) * 1.4
             off = (-tdir * math.cos(a) + tside * math.sin(a)) * 2.2 + UP * 1.3
             shot(place_pt, off, 0.1)
-            frame(ride=False, key="outro" if k == int(3.0 * F) - 1 else None)
+            frame(drawer_ride=False, key="outro" if k == int(3.0 * F) - 1 else None)
     except StopIteration:
         pass
 
