@@ -68,7 +68,49 @@ def make_sim(w, h, pip):
     a0.sensor_specifications = [cam("rgb", [h, w]), cam("depth", [h // 4, w // 4], habitat_sim.SensorType.DEPTH)]
     a1 = habitat_sim.agent.AgentConfiguration()
     a1.sensor_specifications = [cam("head", [pip[1], pip[0]], hfov=60)]
-    return habitat_sim.Simulator(habitat_sim.Configuration(sc, [a0, a1]))
+    a2 = habitat_sim.agent.AgentConfiguration()
+    a2.sensor_specifications = [cam("hand_depth", [pip[1], pip[0]], habitat_sim.SensorType.DEPTH, hfov=80)]
+    return habitat_sim.Simulator(habitat_sim.Configuration(sc, [a0, a1, a2]))
+
+
+CLUTTER = ["frl_apartment_bike_01", "frl_apartment_bike_02", "frl_apartment_table_01",
+           "frl_apartment_monitor", "frl_apartment_setupbox", "frl_apartment_camera_02"]
+
+
+def declutter(sim, names):
+    """remove rigid objects whose handle contains any name; returns removed handles."""
+    rom = sim.get_rigid_object_manager()
+    gone = []
+    for h in list(rom.get_object_handles()):
+        if any(n in h for n in names):
+            rom.remove_object_by_handle(h)
+            gone.append(h)
+    return gone
+
+
+def rebuild_navmesh(sim, radius=0.3, height=1.5):
+    """recompute the navmesh with all furniture treated as obstacles."""
+    rom = sim.get_rigid_object_manager(); aom = sim.get_articulated_object_manager()
+    saved = []
+    for mgr in (rom, aom):
+        for h in mgr.get_object_handles():
+            o = mgr.get_object_by_handle(h)
+            try:
+                saved.append((o, o.motion_type))
+                o.motion_type = habitat_sim.physics.MotionType.STATIC
+            except Exception:
+                pass
+    ns = habitat_sim.NavMeshSettings()
+    ns.set_defaults()
+    ns.agent_radius, ns.agent_height = radius, height
+    ns.include_static_objects = True
+    ok = sim.recompute_navmesh(sim.pathfinder, ns)
+    for o, mt in saved:
+        try:
+            o.motion_type = mt
+        except Exception:
+            pass
+    return ok
 
 
 class Robot:
@@ -249,6 +291,7 @@ def main():
     ap.add_argument("--speed", type=float, default=0.7, help="base speed m/s")
     ap.add_argument("--start-dist", type=float, default=5.0, help="geodesic dist of start from chest")
     ap.add_argument("--selftest", action="store_true", help="diagnostics + stills only")
+    ap.add_argument("--keep-clutter", action="store_true", help="keep bikes / desk in apt_0")
     ap.add_argument("--max-frames", type=int, default=0)
     ap.add_argument("--seed", type=int, default=3)
     args = ap.parse_args()
@@ -262,8 +305,19 @@ def main():
     warn = lambda m: (checks["warnings"].append(m), log("WARN", m))
 
     # ---- navmesh
-    if os.path.exists(NAVMESH):
-        sim.pathfinder.load_nav_mesh(NAVMESH)
+    if args.keep_clutter:
+        if os.path.exists(NAVMESH):
+            sim.pathfinder.load_nav_mesh(NAVMESH)
+    else:
+        gone = declutter(sim, CLUTTER)
+        log("removed clutter:", [g.split("/")[-1] for g in gone])
+        checks["removed_objects"] = [g.split("/")[-1].split(".")[0] for g in gone]
+        if len(gone) < 3:
+            warn(f"declutter removed only {len(gone)} objects")
+        ok = rebuild_navmesh(sim)
+        checks["navmesh_rebuilt"] = bool(ok)
+        checks["navmesh_area_m2"] = round(float(sim.pathfinder.navigable_area), 2)
+        log("navmesh rebuilt", ok, "area", checks["navmesh_area_m2"])
     checks["navmesh_loaded"] = bool(sim.pathfinder.is_loaded)
     log("navmesh loaded:", sim.pathfinder.is_loaded)
 
@@ -395,8 +449,8 @@ def main():
         return mn.Vector3(s[0], s[1], s[2]) if not math.isnan(s[0]) else V(p)
 
     floor0 = snap(dc + fn * 1.2)[1]
-    stand_chest = snap(mn.Vector3(handle0[0], floor0, handle0[2]) + fn * 0.66)
-    if (stand_chest - (mn.Vector3(handle0[0], stand_chest[1], handle0[2]) + fn * 0.66)).length() > 0.25:
+    stand_chest = snap(mn.Vector3(handle0[0], floor0, handle0[2]) + fn * 0.78)
+    if (stand_chest - (mn.Vector3(handle0[0], stand_chest[1], handle0[2]) + fn * 0.78)).length() > 0.25:
         warn("chest stand point snapped >25cm")
     # kitchen table: top via ray down, edge toward the robot's approach side
     if table is not None:
@@ -415,7 +469,7 @@ def main():
                 if hh is None or abs(hh.point[1] - top_y) > 0.03:
                     break
                 edge = r
-            cand = mn.Vector3(tc[0], floor0, tc[2]) + d * (edge + 0.52)
+            cand = mn.Vector3(tc[0], floor0, tc[2]) + d * (edge + 0.62)
             if not sim.pathfinder.is_navigable(cand, 0.5):
                 continue
             path = habitat_sim.ShortestPath()
@@ -464,7 +518,7 @@ def main():
     keydir = os.path.splitext(out)[0] + "_keys"
     os.makedirs(keydir, exist_ok=True)
     writer = None if args.selftest else imageio.get_writer(out, fps=args.fps, quality=8, macro_block_size=1)
-    ag0, ag1 = sim.get_agent(0), sim.get_agent(1)
+    ag0, ag1, ag2 = sim.get_agent(0), sim.get_agent(1), sim.get_agent(2)
     hfov = math.radians(70)
     fx = (W / 2) / math.tan(hfov / 2)
     st = {"eye": None, "tgt": None, "frames": 0, "occl_adj": 0, "vis_ok": 0, "vis_n": 0,
@@ -509,25 +563,61 @@ def main():
         f = T.transform_vector(mn.Vector3(1, 0, 0)).normalized()
         ag1.scene_node.transformation = mn.Matrix4.look_at(p + f * 0.05, p + f, UP)
 
-    def overlay(img, head):
+    def hand_cam():
+        T = rb.link_T("gripper_link")                     # Fetch arm cam (habitat-lab fetch_robot.py)
+        eye = T.transform_point(mn.Vector3(0.0, 0.0, 0.1))
+        tgt = T.transform_point(mn.Vector3(0.1, 0.0, 0.0) + mn.Vector3(0.0, 0.0, 0.1))
+        up = T.transform_vector(mn.Vector3(0.0, 0.0, 1.0)).normalized()
+        ag2.scene_node.transformation = mn.Matrix4.look_at(eye, tgt, up)
+
+    def depth_vis(d, dmax=1.5):
+        d = np.nan_to_num(np.asarray(d, dtype=np.float32), nan=0.0)
+        n = np.clip(d / dmax, 0, 1)
+        u8 = (255 * (1 - n)).astype(np.uint8)
+        u8[d <= 0] = 0
+        return cv2.cvtColor(cv2.applyColorMap(u8, cv2.COLORMAP_TURBO), cv2.COLOR_BGR2RGB)
+
+    from PIL import Image, ImageDraw, ImageFont
+    FD = os.path.join(HERE, "fonts")
+    sc = H / 720.0
+    F_CAP = ImageFont.truetype(os.path.join(FD, "Roboto-Medium.ttf"), int(30 * sc))
+    F_TAG = ImageFont.truetype(os.path.join(FD, "Roboto-Regular.ttf"), int(17 * sc))
+    F_LBL = ImageFont.truetype(os.path.join(FD, "Roboto-Medium.ttf"), int(15 * sc))
+
+    def overlay(img, head, hand):
         h, w = img.shape[:2]
+        pad = int(24 * sc)
+        base = Image.fromarray(img).convert("RGBA")
+        ov = Image.new("RGBA", base.size, (0, 0, 0, 0))
+        dr = ImageDraw.Draw(ov)
         # lower-third caption
         if st["caption"]:
-            (tw, th), _ = cv2.getTextSize(st["caption"], cv2.FONT_HERSHEY_DUPLEX, 0.9, 2)
-            ov = img.copy()
-            cv2.rectangle(ov, (30, h - 90), (30 + tw + 40, h - 40), (15, 15, 15), -1)
-            cv2.addWeighted(ov, 0.6, img, 0.4, 0, img)
-            cv2.putText(img, st["caption"], (50, h - 55), cv2.FONT_HERSHEY_DUPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(img, "Habitat-sim 2.0 | Fetch | ReplicaCAD apt_0 | scripted IK demo",
-                    (w - 620, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (235, 235, 235), 1, cv2.LINE_AA)
-        # PiP head camera
+            tb = dr.textbbox((0, 0), st["caption"], font=F_CAP)
+            tw, th = tb[2] - tb[0], tb[3] - tb[1]
+            x0, y1 = pad + int(8 * sc), h - pad - int(8 * sc)
+            dr.rounded_rectangle([x0 - int(18 * sc), y1 - th - int(30 * sc), x0 + tw + int(18 * sc), y1],
+                                 radius=int(10 * sc), fill=(12, 12, 16, 170))
+            dr.rectangle([x0 - int(18 * sc), y1 - th - int(30 * sc), x0 - int(13 * sc), y1], fill=(64, 196, 255, 230))
+            dr.text((x0, y1 - th - int(15 * sc) - tb[1]), st["caption"], font=F_CAP, fill=(255, 255, 255, 255))
+        # top-right tag
+        tag = "Habitat-sim  ·  Fetch  ·  ReplicaCAD  ·  scripted IK demo"
+        tb = dr.textbbox((0, 0), tag, font=F_TAG)
+        dr.text((w - pad - (tb[2] - tb[0]), pad - tb[1]), tag, font=F_TAG, fill=(255, 255, 255, 215))
+        # PiPs: hand depth above head rgb, bottom-right
         ph, pw = head.shape[:2]
-        x0, y0 = w - pw - 24, h - ph - 24
-        img[y0:y0 + ph, x0:x0 + pw] = head
-        cv2.rectangle(img, (x0 - 2, y0 - 2), (x0 + pw + 1, y0 + ph + 1), (255, 255, 255), 2)
-        cv2.putText(img, "robot head camera", (x0 + 8, y0 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                    (255, 255, 255), 1, cv2.LINE_AA)
-        return img
+        gap = int(10 * sc)
+        slots = [(hand, "HAND CAMERA · DEPTH"), (head, "HEAD CAMERA · RGB")]
+        y = h - pad - 2 * ph - gap
+        x = w - pad - pw
+        for im, lbl in slots:
+            base.paste(Image.fromarray(im), (x, y))
+            dr.rounded_rectangle([x - 2, y - 2, x + pw + 1, y + ph + 1], radius=int(6 * sc), outline=(255, 255, 255, 230), width=2)
+            lb = dr.textbbox((0, 0), lbl, font=F_LBL)
+            dr.rounded_rectangle([x + int(8 * sc), y + int(8 * sc), x + int(16 * sc) + lb[2] - lb[0], y + int(14 * sc) + lb[3]],
+                                 radius=int(4 * sc), fill=(12, 12, 16, 170))
+            dr.text((x + int(12 * sc), y + int(10 * sc)), lbl, font=F_LBL, fill=(255, 255, 255, 255))
+            y += ph + gap
+        return np.asarray(Image.alpha_composite(base, ov).convert("RGB")).copy()
 
     def visible_pt(depth, eye, p, tol=0.35):
         Tcam = mn.Matrix4.look_at(eye, st["tgt"], UP).inverted()
@@ -566,18 +656,21 @@ def main():
             T = rb.link_T("gripper_link")
             can.translation = rb.tip()
             st["can_gap"].append(0.0)
-        head_cam()
+        head_cam(); hand_cam()
         eye = mn.Vector3(ag0.scene_node.transformation.translation)
-        obs = sim.get_sensor_observations(agent_ids=[0, 1])
+        obs = sim.get_sensor_observations(agent_ids=[0, 1, 2])
         img = np.ascontiguousarray(np.array(obs[0]["rgb"])[:, :, :3])
         head = np.ascontiguousarray(np.array(obs[1]["head"])[:, :, :3])
+        hd = np.array(obs[2]["hand_depth"])
+        hand = depth_vis(hd)
+        st.setdefault("hand_valid", []).append(float(np.mean((hd > 0.02) & (hd < 5))))
         depth = np.array(obs[0]["depth"])
         st["vis_n"] += 1
         st["vis_ok"] += int(visible_check(depth, eye))
         for lbl, fp in st.get("focus", {}).items():
             a = st.setdefault("focus_stats", {}).setdefault(lbl, [0, 0])
             a[0] += int(visible_pt(depth, eye, fp() if callable(fp) else fp)); a[1] += 1
-        img = overlay(img, head)
+        img = overlay(img, head, hand)
         if key:
             kp = os.path.join(keydir, f"{len(st['keys']):02d}_{key}.jpg")
             cv2.imwrite(kp, cv2.cvtColor(img, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 88])
@@ -638,6 +731,18 @@ def main():
             rb.look_head(tgt)
             cam()
             frame(held=held, drawer_ride=ride, key=key if k == n else None)
+
+    def base_shift(delta, n, caption, cam, held=False, ride=True):
+        """translate the base; IK keeps the hand fixed in world so the motion reads as deliberate."""
+        st["caption"] = caption
+        p0 = V(rb.pos); hand = rb.tip()
+        for k in range(1, n + 1):
+            newp = p0 + delta * smooth(k / n)
+            rb.spin_wheels((newp - rb.pos).length() * (1 if mn.math.dot(newp - rb.pos, rb.forward()) >= 0 else -1))
+            rb.pos = newp
+            st["ik_err"].append(rb.ik(hand, iters=30))
+            cam()
+            frame(held=held, drawer_ride=ride)
 
     def hold(n, cam, held=False, ride=True, caption=None, key=None):
         if caption:
@@ -723,7 +828,9 @@ def main():
         arm_phase["pull_travel_m"] = float(np.linalg.norm(npv(rb.tip()) - gp0))
         handle_open = handle0 + fn * open_m
         reach(handle_open + fn * 0.1, -fn, int(0.5 * F), "Releasing the handle", chest_cam, fingers=0.045)
-        # 3. pick the object from the drawer
+        # 3. drive in closer for the in-drawer grasp (arm keeps hand still in world)
+        base_shift(-fn * 0.13, int(0.9 * F), "Moving closer to the open drawer", chest_cam)
+        # pick the object from the drawer
         objp = lambda: can.translation
         above = objp() + UP * (can_h / 2 + 0.12)
         reach(above, -UP, int(1.3 * F), "Reaching into the drawer", chest_cam, key="reach_object")
@@ -734,6 +841,8 @@ def main():
         reach(lambda s: V(tp0) + UP * (0.25 * s), -UP, int(1.0 * F), "Lifting the object", chest_cam,
               held=True, ride=False, key="lifted")
         arm_phase["lift_travel_m"] = float(np.linalg.norm(npv(rb.tip()) - tp0))
+        # back out to the handle standoff before closing
+        base_shift(fn * 0.13, int(0.9 * F), "Backing up", chest_cam, held=True, ride=False)
         # 4. push the drawer closed with the (holding) hand
         push0 = handle_open + fn * 0.05 + UP * 0.02
         reach(push0, -fn, int(1.0 * F), "Closing the drawer", chest_cam, held=True, ride=False)
@@ -786,6 +895,7 @@ def main():
         **{k: round(v, 3) for k, v in arm_phase.items()},
         render_s=round(time.time() - t_start, 1),
         ik_p95_cm_by_phase={k: round(100 * float(np.percentile(v, 95)), 1) for k, v in st.get("ik_phase", {}).items()},
+        hand_depth_valid_frac=round(float(np.mean(st.get("hand_valid", [0]))), 3),
         focus_visible_frac={k: round(a / max(1, b), 3) for k, (a, b) in st.get("focus_stats", {}).items()},
     )
     if not args.selftest and table is not None:
