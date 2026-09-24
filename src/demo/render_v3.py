@@ -15,7 +15,7 @@ to the kitchen table in ReplicaCAD apt_0 (Habitat-sim 0.3.3, Bullet physics).
 
 This is a SCRIPTED (non-learned) demonstration; label it as such.
 """
-import argparse, json, math, os, sys, time
+import argparse, json, math, os, re, sys, time
 import numpy as np
 import habitat_sim
 import magnum as mn
@@ -158,6 +158,12 @@ class Robot:
         T = self.link_T("gripper_link")
         return T.translation + T.transform_vector(mn.Vector3(1, 0, 0)).normalized() * self.tip_off
 
+    def finger_dir(self):
+        a = self.link_T("l_gripper_finger_link").translation
+        b = self.link_T("r_gripper_finger_link").translation
+        d = a - b
+        return d.normalized() if d.length() > 1e-5 else self.link_T("gripper_link").transform_vector(mn.Vector3(0, 1, 0)).normalized()
+
     def grip_axis(self):
         return self.link_T("gripper_link").transform_vector(mn.Vector3(1, 0, 0)).normalized()
 
@@ -186,46 +192,24 @@ class Robot:
                 self.q[self.jm[n]] += dist / 0.0613
 
     # --- IK ------------------------------------------------------------------
-    def plan(self, target, axis=None):
-        """global-ish solve: several seeds, many iterations. Returns (q_solution, err); restores q."""
-        q_save = self.q.copy()
-        seeds = [q_save.copy()]
-        ready = q_save.copy()
-        for n, v in zip(ARM, [0.0, -0.4, 0.0, 1.4, 0.0, 0.6, 0.0]):
-            ready[self.jm[n]] = v
-        seeds.append(ready)
-        for _ in range(4):
-            r = q_save.copy()
-            lo_ = np.clip(self.lo[self.arm_idx], -math.pi, math.pi); hi_ = np.clip(self.hi[self.arm_idx], -math.pi, math.pi)
-            r[self.arm_idx] = np.random.uniform(lo_ * 0.6, hi_ * 0.6)
-            seeds.append(r)
-        best = (None, 1e9)
-        for sd in seeds:
-            self.q = sd.copy()
-            e = self.ik(target, axis=axis, iters=150)
-            # prefer solutions close to the current pose when errors tie
-            cost = e + 0.002 * float(np.linalg.norm(self.q[self.ik_idx] - q_save[self.ik_idx]))
-            if cost < best[1]:
-                best = (self.q.copy(), cost, e)
-            if e < 0.004 and sd is seeds[0]:
-                break
-        self.q = q_save; self.apply()
-        return best[0], best[2]
-
-    def ik(self, target, axis=None, iters=60, tol=0.004, w_axis=0.12):
-        """DLS IK on the 7 arm joints using the simulator's FK. Returns pos err (m)."""
+    def ik(self, target, axis=None, iters=60, tol=0.004, w_axis=0.12, fin=None, w_fin=0.10):
+        """DLS IK (torso + 7 arm joints) on the simulator's FK. Returns pos err (m).
+        axis: desired approach direction of the gripper; fin: desired finger opening line (sign-free)."""
         target = npv(target)
         ax_t = None if axis is None else npv(V(axis).normalized())
+        fin_t = None if fin is None else npv(V(fin).normalized())
         idx = self.ik_idx
         eps = 1e-3
         lam = 0.05
 
         def resid():
             self.apply()
-            e = target - npv(self.tip())
-            if ax_t is None:
-                return e
-            return np.concatenate([e, w_axis * np.cross(npv(self.grip_axis()), ax_t)])
+            parts = [target - npv(self.tip())]
+            if ax_t is not None:
+                parts.append(w_axis * np.cross(npv(self.grip_axis()), ax_t))
+            if fin_t is not None:
+                parts.append(w_fin * np.cross(npv(self.finger_dir()), fin_t))
+            return np.concatenate(parts)
 
         r = resid()
         for _ in range(iters):
@@ -242,6 +226,98 @@ class Robot:
             self.q[idx] = np.clip(q0[idx] + dq, self.lo[idx], self.hi[idx])
             r = resid()
         return float(np.linalg.norm(r[:3]))
+
+
+# ----------------------------------------------------------------------------- collisions
+class Collider:
+    """Bullet contact queries for the robot (+ held object) against the scene.
+
+    The robot is KINEMATIC for rendering. Bullet does not generate contacts between
+    kinematic and static bodies, so `mode` may temporarily switch the movers to
+    DYNAMIC for the query only (no physics step is taken while switched)."""
+    BASE_LINKS = ("R:base", "R:l_wheel_link", "R:r_wheel_link", "R:bellows_link", "R:estop_link", "R:laser_link")
+
+    def __init__(self, sim, rb, drawer, table):
+        self.sim, self.rb, self.drawer, self.table = sim, rb, drawer, table
+        self.rom = sim.get_rigid_object_manager()
+        chest = drawer.ao
+        self.chest_oids = set(drawer.ids)
+        self.drawer_oids = {oid for oid, l in chest.link_object_ids.items() if l == drawer.lid}
+        self.can = None
+        self.held = False
+        self.mode = "kinematic"
+        self.n, self.t = 0, 0.0
+
+    def label(self, oid, lid):
+        rb = self.rb
+        if oid in rb.ids:
+            l = rb.ao.link_object_ids.get(oid, lid)
+            try:
+                return "R:" + (rb.ao.get_link_name(l) if l is not None and l >= 0 else "base")
+            except Exception:
+                return "R:base"
+        if self.can is not None and oid == self.can.object_id:
+            return "held_can" if self.held else "can"
+        if oid in self.drawer_oids or (oid == self.drawer.ao.object_id and lid == self.drawer.lid):
+            return "drawer"
+        if oid in self.chest_oids:
+            return "chest"
+        if self.table is not None and oid == self.table.object_id:
+            return "table"
+        if oid < 0:
+            return "stage"
+        try:
+            return "obj:" + self.rom.get_object_by_id(oid).handle.split("/")[-1].split(":")[0].rstrip("_")
+        except Exception:
+            return f"id{oid}"
+
+    def contacts(self, pen=0.006):
+        t0 = time.time()
+        movers = [self.rb.ao] + ([self.can] if (self.can is not None and self.held) else [])
+        saved = []
+        if self.mode == "dynamic":
+            for o in movers:
+                saved.append((o, o.motion_type))
+                o.motion_type = habitat_sim.physics.MotionType.DYNAMIC
+            try:
+                self.rb.apply()
+            except Exception:
+                pass
+        try:
+            self.sim.perform_discrete_collision_detection()
+            cps = self.sim.get_physics_contact_points()
+        finally:
+            for o, mt in saved:
+                o.motion_type = mt
+        out = {}
+        for c in cps:
+            if c.contact_distance > -pen:
+                continue
+            la = self.label(c.object_id_a, c.link_id_a)
+            lb = self.label(c.object_id_b, c.link_id_b)
+            ra = la.startswith("R:") or la == "held_can"
+            rbb = lb.startswith("R:") or lb == "held_can"
+            if ra == rbb:
+                continue
+            me, other = (la, lb) if ra else (lb, la)
+            if other == "held_can" or me == "held_can" and other.startswith("R:"):
+                continue
+            pa = getattr(c, "position_on_a_in_ws", None)
+            if me in self.BASE_LINKS and (pa is None or pa[1] < 0.10):
+                continue  # wheels / base on the floor or rugs
+            k = (me, other)
+            out[k] = max(out.get(k, 0.0), -float(c.contact_distance))
+        self.n += 1
+        self.t += time.time() - t0
+        return out
+
+
+def allowed(key, allow):
+    me, other = key
+    return any(re.search(a, me) and re.search(b, other) for a, b in allow)
+
+
+HAND = r"R:(gripper_link|l_gripper_finger_link|r_gripper_finger_link)"
 
 
 # ----------------------------------------------------------------------------- scene helpers
@@ -414,7 +490,7 @@ def main():
     # drawer floor (while open) + clearance (while closed) -> choose object
     drawer.set(open_q)
     hw = drawer.T().translation
-    probe = handle0 + fn * open_m - fn * 0.075
+    probe = handle0 + fn * open_m - fn * 0.095
     f_hit = raycast(sim, mn.Vector3(probe[0], handle0[1] + 0.4, probe[2]), -UP, 1.0, ignore=rb.ids)
     floor_y = f_hit.point[1] if (f_hit is not None and f_hit.object_id in drawer.ids) else handle0[1] - 0.05
     if f_hit is None or f_hit.object_id not in drawer.ids:
@@ -430,7 +506,7 @@ def main():
     otm = sim.get_object_template_manager()
     otm.load_configs(YCB_CFG)
     rom = sim.get_rigid_object_manager()
-    can, can_h, obj_name, can_c = None, 0.1, None, 0.05
+    can, can_h, obj_name, can_c, can_r = None, 0.1, None, 0.05, 0.035
     for name in args.objects.split(","):
         hs = otm.get_template_handles(name)
         if not hs:
@@ -451,9 +527,17 @@ def main():
             warn(f"height rays missed {name}"); hgt, c_off = 0.1, 0.05
         else:
             hgt, c_off = float(top - bot), float(air[1] - bot)
-        log(f"  {name}: height {hgt:.3f} centre-above-bottom {c_off:.3f}")
+        mid = air + UP * 0.0
+        rs = []
+        for d in (mn.Vector3(1, 0, 0), mn.Vector3(-1, 0, 0), mn.Vector3(0, 0, 1), mn.Vector3(0, 0, -1)):
+            ray = habitat_sim.geo.Ray(mid + d * 0.4 + UP * (0.0 if top is None else (top + bot) / 2 - air[1]), -d)
+            for h2 in sim.cast_ray(ray, 1.0).hits:
+                if h2.object_id == o.object_id:
+                    rs.append(0.4 - h2.ray_distance); break
+        c_rad = float(np.median(rs)) if rs else 0.035
+        log(f"  {name}: height {hgt:.3f} centre-above-bottom {c_off:.3f} radius {c_rad:.3f}")
         if hgt < clearance - 0.02 or name == args.objects.split(",")[-1]:
-            can, can_h, obj_name, can_c = o, hgt, name, c_off
+            can, can_h, obj_name, can_c, can_r = o, hgt, name, c_off, c_rad
             break
         rom.remove_object_by_id(o.object_id)
     checks.update(object=obj_name, object_height_m=round(can_h, 3))
@@ -478,11 +562,20 @@ def main():
     stand_chest = snap(mn.Vector3(handle0[0], floor0, handle0[2]) + fn * 0.78)
     if (stand_chest - (mn.Vector3(handle0[0], stand_chest[1], handle0[2]) + fn * 0.78)).length() > 0.25:
         warn("chest stand point snapped >25cm")
+    def table_y(p):
+        """height of the table's own surface under (x,z), ignoring things standing on it."""
+        ray = habitat_sim.geo.Ray(mn.Vector3(p[0], 2.2, p[2]), -UP)
+        for hh in sim.cast_ray(ray, 3.0).hits:
+            if hh.object_id == table.object_id:
+                return float(hh.point[1])
+        return None
+
     # kitchen table: top via ray down, edge toward the robot's approach side
     if table is not None:
         tc = table.translation
-        t_hit = raycast(sim, mn.Vector3(tc[0], 2.0, tc[2]), -UP, 3.0, ignore=rb.ids | can_ids)
-        top_y = t_hit.point[1] if t_hit is not None else tc[1] + 0.4
+        top_y = table_y(tc)
+        if top_y is None:
+            warn("table centre ray missed"); top_y = tc[1] + 0.35
         # candidate stands on a ring; choose navigable one with nearest geodesic to chest stand
         best = None
         for ang in np.linspace(0, 2 * math.pi, 24, endpoint=False):
@@ -490,12 +583,11 @@ def main():
             # march to table edge
             edge = 0.0
             for r in np.arange(0.05, 1.5, 0.03):
-                hh = raycast(sim, mn.Vector3(tc[0], top_y + 0.3, tc[2]) + d * r, -UP, 0.4,
-                             ignore=rb.ids | can_ids)
-                if hh is None or abs(hh.point[1] - top_y) > 0.03:
+                ty = table_y(mn.Vector3(tc[0], 0, tc[2]) + d * r)
+                if ty is None or abs(ty - top_y) > 0.03:
                     break
                 edge = r
-            cand = mn.Vector3(tc[0], floor0, tc[2]) + d * (edge + 0.62)
+            cand = mn.Vector3(tc[0], floor0, tc[2]) + d * (edge + 0.55)
             if not sim.pathfinder.is_navigable(cand, 0.5):
                 continue
             path = habitat_sim.ShortestPath()
@@ -508,9 +600,224 @@ def main():
             warn("no navigable table stand; using fallback")
             best = (0, snap(tc + mn.Vector3(0.9, 0, 0)), mn.Vector3(1, 0, 0), 0.4)
         _, stand_table, tdir, tedge = best
-        place_pt = mn.Vector3(tc[0], top_y, tc[2]) + tdir * max(0.0, tedge - 0.10)
+        place_pt = mn.Vector3(tc[0], top_y, tc[2]) + tdir * max(0.0, tedge - 0.18)  # refined below
         checks.update(table_top_y=round(float(top_y), 3), table_edge_m=round(float(tedge), 3))
         log("table top", round(top_y, 3), "edge", round(tedge, 3), "place", [round(x, 3) for x in place_pt])
+    # ---- collision checker + motion planner ---------------------------------
+    col = Collider(sim, rb, drawer, table)
+    col.can = can
+    grasp_dz = can_h - can_c - 0.035          # fingertip centre sits 3.5 cm below the can top
+    st_col = {"rrt": 0, "cart": 0, "via": 0, "fallback": 0}
+
+    def put_held_can():
+        if col.held and st_col.get("can_rel") is not None:
+            can.transformation = rb.link_T("gripper_link") @ st_col["can_rel"]
+
+    def collisions(q, allow):
+        rb.q = q.copy(); rb.apply(); put_held_can()
+        return {k: v for k, v in col.contacts().items() if not allowed(k, allow)}
+
+    def goal_ik(target, axis, fin, allow, q_ref=None):
+        """multi-seed IK; returns (q, err) of the best collision-free solution (or best overall)."""
+        q_ref = rb.q.copy() if q_ref is None else q_ref
+        seeds = [q_ref.copy()]
+        ready = q_ref.copy()
+        for n_, v in zip(ARM, [0.0, -0.4, 0.0, 1.4, 0.0, 0.6, 0.0]):
+            ready[rb.jm[n_]] = v
+        seeds.append(ready)
+        lo_ = np.clip(rb.lo, -math.pi, math.pi); hi_ = np.clip(rb.hi, -math.pi, math.pi)
+        for _ in range(6):
+            r_ = q_ref.copy(); r_[rb.arm_idx] = np.random.uniform(lo_[rb.arm_idx] * 0.7, hi_[rb.arm_idx] * 0.7)
+            seeds.append(r_)
+        best_free, best_any = None, None
+        for sd in seeds:
+            rb.q = sd.copy()
+            e = rb.ik(target, axis=axis, fin=fin, iters=150)
+            q_ = rb.q.copy()
+            cost = e + 0.003 * float(np.linalg.norm(q_[rb.ik_idx] - q_ref[rb.ik_idx]))
+            if best_any is None or cost < best_any[2]:
+                best_any = (q_, e, cost)
+            if e < 0.01 and not collisions(q_, allow):
+                if best_free is None or cost < best_free[2]:
+                    best_free = (q_, e, cost)
+                if sd is seeds[0]:
+                    break
+        rb.q = q_ref.copy(); rb.apply(); put_held_can()
+        b = best_free or best_any
+        return b[0], b[1], best_free is not None
+
+    def nlerp(a, b, s_):
+        if a is None or b is None:
+            return b
+        v = a * (1 - s_) + b * s_
+        return v.normalized() if v.length() > 1e-6 else b
+
+    def cart_path(q0, waypts, axis, fin, allow, step=0.015):
+        """straight Cartesian segments through waypoints, IK-continued; None if blocked."""
+        q = q0.copy(); rb.q = q.copy(); rb.apply()
+        qs = [q.copy()]
+        a0, f0 = rb.grip_axis(), (rb.finger_dir() if fin is not None else None)
+        for wi, wp in enumerate(waypts):
+            rb.q = q.copy(); rb.apply()
+            p0 = rb.tip(); L = (V(wp) - p0).length()
+            n_ = max(2, int(math.ceil(L / step)))
+            for k in range(1, n_ + 1):
+                s_ = k / n_
+                ax = nlerp(a0, V(axis), s_) if (wi == 0 and axis is not None) else axis
+                fi = nlerp(f0, V(fin), s_) if (wi == 0 and fin is not None) else fin
+                rb.q = q.copy()
+                e = rb.ik(p0 + (V(wp) - p0) * s_, axis=ax, fin=fi, iters=25)
+                qn = rb.q.copy()
+                if e > 0.015 or np.max(np.abs(qn[rb.ik_idx] - q[rb.ik_idx])) > 0.35:
+                    return None
+                if collisions(qn, allow):
+                    return None
+                qs.append(qn); q = qn
+        return qs
+
+    def edge_free(a, b, allow, res=0.04):
+        d = float(np.max(np.abs(b[rb.ik_idx] - a[rb.ik_idx])))
+        for k in range(1, max(1, int(d / res)) + 1):
+            if collisions(a + (b - a) * (k / max(1, int(d / res))), allow):
+                return False
+        return True
+
+    def rrt_connect(q0, qg, allow, iters=1500, step=0.15):
+        idx = rb.ik_idx
+        lo_ = np.clip(rb.lo, -math.pi, math.pi); hi_ = np.clip(rb.hi, -math.pi, math.pi)
+        Ta, Pa, Tb, Pb = [q0.copy()], [-1], [qg.copy()], [-1]
+
+        def extend(T, P, target):
+            i = int(np.argmin([np.linalg.norm(t[idx] - target[idx]) for t in T]))
+            d = target - T[i]; L = np.linalg.norm(d[idx])
+            qn = target.copy() if L <= step else T[i] + d * (step / L)
+            if not edge_free(T[i], qn, allow):
+                return None
+            T.append(qn); P.append(i)
+            return len(T) - 1
+
+        for it in range(iters):
+            r_ = q0.copy(); r_[idx] = np.random.uniform(lo_[idx], hi_[idx])
+            ia = extend(Ta, Pa, r_)
+            if ia is not None:
+                while True:
+                    ib = extend(Tb, Pb, Ta[ia])
+                    if ib is None:
+                        break
+                    if np.linalg.norm(Tb[ib][idx] - Ta[ia][idx]) < 1e-6:
+                        pa, i = [], ia
+                        while i != -1:
+                            pa.append(Ta[i]); i = Pa[i]
+                        pb, i = [], ib
+                        while i != -1:
+                            pb.append(Tb[i]); i = Pb[i]
+                        path_ = pa[::-1] + pb[1:]
+                        if not np.allclose(path_[0][idx], q0[idx]):
+                            path_ = path_[::-1]
+                        # shortcut smoothing
+                        for _ in range(150):
+                            if len(path_) < 3:
+                                break
+                            i, j = sorted(np.random.choice(len(path_), 2, replace=False))
+                            if j - i > 1 and edge_free(path_[i], path_[j], allow):
+                                path_ = path_[:i + 1] + path_[j:]
+                        return path_
+            Ta, Pa, Tb, Pb = Tb, Pb, Ta, Pa
+        return None
+
+    def plan_reach(target, axis, fin, allow, tag):
+        """collision-free joint path from current q to a pose at `target`."""
+        q0 = rb.q.copy(); rb.apply(); put_held_can()
+        T = V(target)
+        pre = T - V(axis) * 0.13 if axis is not None else T + UP * 0.13
+        p0 = rb.tip(); fwd = rb.forward()
+        home = rb.pos + fwd * 0.35 + UP * 1.10
+        start_bad = collisions(q0, allow)
+        if start_bad:
+            warn(f"'{tag}' starts in contact: {sorted(start_bad)}")
+        for kind, w in (("cart", [T]), ("via", [pre, T]), ("via", [p0 + UP * 0.12, pre, T]),
+                        ("via", [p0 - fwd * 0.15 + UP * 0.08, pre, T]), ("via", [home, pre, T])):
+            qs = cart_path(q0, w, axis, fin, allow)
+            if qs is not None:
+                st_col[kind] += 1
+                return qs
+        qg, e, ok = goal_ik(T, axis, fin, allow, q_ref=q0)
+        if ok:
+            qs = rrt_connect(q0, qg, allow)
+            if qs is not None:
+                st_col["rrt"] += 1
+                log(f"'{tag}': RRT path with {len(qs)} nodes")
+                return qs
+        st_col["fallback"] += 1
+        warn(f"'{tag}': no collision-free path (goal ok={ok}, err={e*100:.1f}cm) -> joint interpolation")
+        rb.q = q0.copy(); rb.apply()
+        return [q0, qg]
+
+    # ---- probe: does the collision query see the robot? pick a query mode.
+    rb.pos = stand_chest; rb.yaw = math.atan2(fn[2], -fn[0]); rb.apply()
+    q_tuck = rb.q.copy()
+    probe_q, _, _ = goal_ik(handle0 - fn * 0.25, -fn, None, [(r".*", r".*")])
+    for mode in ("kinematic", "dynamic"):
+        col.mode = mode
+        hit = collisions(probe_q, [])
+        clean = collisions(q_tuck, [])
+        log(f"collision probe [{mode}]: arm-in-chest -> {sorted(hit)} | tucked -> {sorted(clean)}")
+        if any(o in ("chest", "drawer") for _, o in hit):
+            break
+    else:
+        warn("collision checker cannot see arm-chest contact; planning is blind")
+    checks["collision_mode"] = col.mode
+    checks["collision_probe_tucked_contacts"] = sorted(map(list, clean))
+    rb.q = q_tuck.copy(); rb.apply()
+
+    # ---- choose a clear, reachable place spot on the table
+    if table is not None:
+        tside0 = mn.Vector3(-tdir[2], 0, tdir[0])
+        centre_top = mn.Vector3(tc[0], top_y, tc[2])
+
+        def spot_clear(p_):
+            for a_ in [None] + list(np.linspace(0, 2 * math.pi, 12, endpoint=False)):
+                q_ = p_ if a_ is None else p_ + mn.Vector3(math.cos(a_), 0, math.sin(a_)) * (can_r + 0.04)
+                ray = habitat_sim.geo.Ray(mn.Vector3(q_[0], top_y + 0.7, q_[2]), -UP)
+                hs = [hh for hh in sim.cast_ray(ray, 1.0).hits if hh.object_id not in rb.ids | {can.object_id}]
+                if not hs or hs[0].object_id != table.object_id or abs(hs[0].point[1] - top_y) > 0.012:
+                    return False
+            return True
+
+        saved_pose = (V(rb.pos), rb.yaw, rb.q.copy())
+        rb.pos = stand_table
+        chosen = None
+        tried = 0
+        for inset in (0.22, 0.18, 0.14, 0.26, 0.10):
+            for lat in (0.0, 0.08, -0.08, 0.16, -0.16):
+                p_ = centre_top + tdir * max(0.0, tedge - inset) + tside0 * lat
+                if not spot_clear(p_):
+                    continue
+                tried += 1
+                rb.yaw = math.atan2(-(p_ - rb.pos)[2], (p_ - rb.pos)[0])
+                rb.q = q_tuck.copy(); rb.apply()
+                tip_t = p_ + UP * (can_c + 0.004 + grasp_dz)
+                qg, e, ok = goal_ik(tip_t, -UP, None, [("^R:", "^can$")])
+                col.held = True
+                if ok:
+                    # can pose while held vertically: origin = tip - UP*grasp_dz
+                    rb.q = qg; rb.apply()
+                    can.translation = rb.tip() - UP * grasp_dz
+                    bad = {k: v for k, v in col.contacts().items() if not allowed(k, [("held_can", "^table$")])}
+                    ok = not bad
+                col.held = False
+                if ok:
+                    chosen = (p_, inset, lat); break
+            if chosen:
+                break
+        rb.pos, rb.yaw, rb.q = saved_pose; rb.apply(); can_follow_drawer()
+        if chosen is None:
+            warn(f"no clear+reachable place spot found ({tried} clear spots tried); using default")
+        else:
+            place_pt = chosen[0]
+            checks.update(place_inset_m=chosen[1], place_lateral_m=chosen[2])
+        log("place spot", [round(x, 3) for x in place_pt], "chosen", chosen is not None)
+
     # start: navigable point ~start-dist geodesic from chest stand
     start = None
     for _ in range(400):
@@ -679,9 +986,14 @@ def main():
         if drawer_ride:
             can_follow_drawer()
         if held:
-            T = rb.link_T("gripper_link")
-            can.translation = rb.tip()
-            st["can_gap"].append(0.0)
+            put_held_can()
+        bad = {k: v for k, v in col.contacts().items() if not allowed(k, st.get("allow", []))}
+        if bad:
+            st["coll_frames"] = st.get("coll_frames", 0) + 1
+            d_ = st.setdefault("coll_by_phase", {}).setdefault(st["caption"], {})
+            for k, v in bad.items():
+                kk = f"{k[0]} x {k[1]}"
+                d_[kk] = max(d_.get(kk, 0.0), round(v, 3))
         head_cam(); hand_cam()
         eye = mn.Vector3(ag0.scene_node.transformation.translation)
         obs = sim.get_sensor_observations(agent_ids=[0, 1, 2])
@@ -710,6 +1022,7 @@ def main():
     # ---- motion primitives
     def drive(path, caption, held=False, ride=True):
         st["caption"] = caption
+        st["allow"] = []
         for i in range(len(path) - 1):
             a, b = path[i], path[i + 1]
             seg = b - a
@@ -725,7 +1038,7 @@ def main():
                 rb.pos = newp
                 rb.look_head(rb.pos + rb.forward() * 3.0)
                 if held:
-                    rb.ik(rb.pos + rb.forward() * 0.45 + UP * 0.85, axis=rb.forward(), iters=8)
+                    rb.ik(rb.pos + rb.forward() * 0.40 + UP * 0.95, axis=-UP, iters=8)
                 chase()
                 frame(held=held, drawer_ride=ride, key="nav" if (k == n // 2 and i == (len(path) - 2) // 2) else None)
 
@@ -740,37 +1053,56 @@ def main():
             frame(held=held, drawer_ride=ride)
         rb.yaw = tyaw
 
-    def reach(target, axis, n, caption, cam, held=False, ride=True, fingers=None, key=None, extra=None):
+    def reach(target, axis, n, caption, cam, held=False, ride=True, fingers=None, key=None, extra=None,
+              fin=None, allow=()):
         st["caption"] = caption
-        p0 = rb.tip()
-        f0 = rb.q[rb.jm["l_gripper_finger_link"]] if "l_gripper_finger_link" in rb.jm else 0.0
-        q_from = q_to = None
-        if not callable(target):
-            q_from = rb.q.copy()
-            q_to, perr = rb.plan(V(target), axis)
-            st.setdefault("plan_err", {})[caption] = round(100 * perr, 2)
-            if perr > 0.03:
-                warn(f"plan '{caption}' unreachable by {perr*100:.1f} cm")
-        for k in range(1, n + 1):
-            s = smooth(k / n)
-            if extra:
-                extra(s)
-            if q_to is not None:
-                keep = [rb.q[rb.jm[nm]] for nm in ("l_gripper_finger_link", "r_gripper_finger_link") if nm in rb.jm]
-                rb.q = q_from + (q_to - q_from) * s
-                for nm, v in zip(("l_gripper_finger_link", "r_gripper_finger_link"), keep):
-                    rb.q[rb.jm[nm]] = v
-                rb.apply()
-                tgt = V(target)
-                err = float((rb.tip() - tgt).length()) if k == n else None
-            else:
-                tgt = target(s)
-                err = rb.ik(tgt, axis=axis, iters=40)
-            if err is not None:
-                st["ik_err"].append(err)
-                st.setdefault("ik_phase", {}).setdefault(caption, []).append(err)
+        st["allow"] = list(allow)
+        fj = [rb.jm[nm] for nm in ("l_gripper_finger_link", "r_gripper_finger_link") if nm in rb.jm]
+        f0 = rb.q[fj[0]] if fj else 0.0
+
+        def set_f(s_):
             if fingers is not None:
-                rb.set_fingers(f0 + (fingers - f0) * s)
+                rb.set_fingers(f0 + (fingers - f0) * s_)
+
+        if not callable(target):
+            qs = plan_reach(target, axis, fin, allow, caption)
+            idx = rb.ik_idx
+            cum = [0.0]
+            for i in range(1, len(qs)):
+                cum.append(cum[-1] + float(np.linalg.norm(qs[i][idx] - qs[i - 1][idx])))
+            tot = cum[-1]
+            n = max(n, int(tot / 1.0 * args.fps))          # joint-space speed cap ~1 rad/s
+            for k in range(1, n + 1):
+                s_ = smooth(k / n)
+                d = s_ * tot
+                j = max(1, int(np.searchsorted(cum, d, side="left")))
+                j = min(j, len(qs) - 1)
+                seg = cum[j] - cum[j - 1]
+                u = 0.0 if seg < 1e-9 else (d - cum[j - 1]) / seg
+                fv = rb.q[fj].copy() if fj else None
+                rb.q = qs[j - 1] + (qs[j] - qs[j - 1]) * u
+                if fj:
+                    rb.q[fj] = fv
+                set_f(s_)
+                if extra:
+                    extra(s_)
+                rb.apply()
+                rb.look_head(V(target))
+                cam()
+                frame(held=held, drawer_ride=ride, key=key if k == n else None)
+            err = float((rb.tip() - V(target)).length())
+            st["ik_err"].append(err)
+            st.setdefault("ik_phase", {}).setdefault(caption, []).append(err)
+            return
+        for k in range(1, n + 1):
+            s_ = smooth(k / n)
+            if extra:
+                extra(s_)
+            tgt = target(s_)
+            err = rb.ik(tgt, axis=axis, fin=fin, iters=40)
+            st["ik_err"].append(err)
+            st.setdefault("ik_phase", {}).setdefault(caption, []).append(err)
+            set_f(s_)
             rb.look_head(tgt)
             cam()
             frame(held=held, drawer_ride=ride, key=key if k == n else None)
@@ -778,12 +1110,13 @@ def main():
     def base_shift(delta, n, caption, cam, held=False, ride=True):
         """translate the base; IK keeps the hand fixed in world so the motion reads as deliberate."""
         st["caption"] = caption
-        p0 = V(rb.pos); hand = rb.tip()
+        st["allow"] = []
+        p0 = V(rb.pos); hand = rb.tip(); a0 = rb.grip_axis(); f0 = rb.finger_dir()
         for k in range(1, n + 1):
             newp = p0 + delta * smooth(k / n)
             rb.spin_wheels((newp - rb.pos).length() * (1 if mn.math.dot(newp - rb.pos, rb.forward()) >= 0 else -1))
             rb.pos = newp
-            st["ik_err"].append(rb.ik(hand, iters=30))
+            st["ik_err"].append(rb.ik(hand, axis=a0, fin=f0, iters=30))
             cam()
             frame(held=held, drawer_ride=ride)
 
@@ -861,38 +1194,49 @@ def main():
         # 2. open the drawer by its handle
         st["focus"] = {"handle": lambda: handle0 + fn * (drawer.get() - drawer.lo) * per_unit,
                        "object": lambda: can.translation}
+        HANDLE_OK = [(HAND, r"^drawer$")]
+        side_ax = mn.Vector3(-fn[2], 0, fn[0])      # fingers straddle the can across the drawer
+        close_f = max(0.0, can_r - 0.004)
         pre = handle0 + fn * 0.12
-        reach(pre, -fn, int(1.3 * F), "Reaching for the drawer handle (IK)", chest_cam, fingers=0.045, key="reach_handle")
-        reach(handle0, -fn, int(0.5 * F), "Grasping the handle", chest_cam, fingers=0.045)
-        reach(handle0, -fn, int(0.35 * F), "Grasping the handle", chest_cam, fingers=0.012)
+        reach(pre, -fn, int(1.3 * F), "Reaching for the drawer handle", chest_cam, fingers=0.045,
+              fin=UP, key="reach_handle")
+        reach(handle0, -fn, int(0.6 * F), "Grasping the handle", chest_cam, fin=UP, allow=HANDLE_OK)
+        reach(handle0, -fn, int(0.35 * F), "Grasping the handle", chest_cam, fingers=0.012, fin=UP, allow=HANDLE_OK)
         gp0 = npv(rb.tip())
-        reach(lambda s: handle0 + fn * (open_m * s), -fn, int(1.6 * F), "Pulling the drawer open", chest_cam,
-              extra=lambda s: drawer.set(drawer.lo + (open_q - drawer.lo) * s), key="drawer_open")
+        reach(lambda s_: handle0 + fn * (open_m * s_), -fn, int(1.6 * F), "Pulling the drawer open", chest_cam,
+              fin=UP, allow=HANDLE_OK, extra=lambda s_: drawer.set(drawer.lo + (open_q - drawer.lo) * s_),
+              key="drawer_open")
         arm_phase["pull_travel_m"] = float(np.linalg.norm(npv(rb.tip()) - gp0))
         handle_open = handle0 + fn * open_m
-        reach(handle_open + fn * 0.1, -fn, int(0.5 * F), "Releasing the handle", chest_cam, fingers=0.045)
-        # 3. drive in closer for the in-drawer grasp (arm keeps hand still in world)
+        reach(handle_open + fn * 0.12, -fn, int(0.6 * F), "Releasing the handle", chest_cam, fingers=0.045,
+              fin=UP, allow=HANDLE_OK)
+        # 3. drive in for the in-drawer grasp
         base_shift(-fn * 0.13, int(0.9 * F), "Moving closer to the open drawer", chest_cam)
-        # pick the object from the drawer
-        objp = lambda: can.translation
-        above = objp() + UP * (can_h / 2 + 0.12)
-        reach(above, -UP, int(1.3 * F), "Reaching into the drawer", chest_cam, key="reach_object")
-        reach(objp() + UP * 0.0, -UP, int(0.7 * F), "Grasping the object", chest_cam)
-        reach(objp(), -UP, int(0.35 * F), "Grasping the object", chest_cam, fingers=0.015)
+        grasp_t = lambda: can.translation + UP * grasp_dz
+        reach(grasp_t() + UP * 0.14, -UP, int(1.4 * F), "Reaching into the drawer", chest_cam, fin=side_ax,
+              key="reach_object")
+        reach(grasp_t(), -UP, int(0.8 * F), "Grasping the object", chest_cam, fin=side_ax,
+              allow=[(HAND, r"^can$")])
+        reach(grasp_t(), -UP, int(0.45 * F), "Grasping the object", chest_cam, fin=side_ax, fingers=close_f,
+              allow=[(HAND, r"^can$")])
+        col.held = True
+        st_col["can_rel"] = rb.link_T("gripper_link").inverted() @ can.transformation
         can_ids.add(can.object_id)
         tp0 = npv(rb.tip())
-        reach(lambda s: V(tp0) + UP * (0.25 * s), -UP, int(1.0 * F), "Lifting the object", chest_cam,
-              held=True, ride=False, key="lifted")
+        reach(lambda s_: V(tp0) + UP * (0.22 * s_), -UP, int(1.0 * F), "Lifting the object", chest_cam,
+              held=True, ride=False, fin=side_ax, allow=[("held_can", r"^drawer$")], key="lifted")
         arm_phase["lift_travel_m"] = float(np.linalg.norm(npv(rb.tip()) - tp0))
-        # back out to the handle standoff before closing
         base_shift(fn * 0.13, int(0.9 * F), "Backing up", chest_cam, held=True, ride=False)
-        # 4. push the drawer closed with the (holding) hand
-        push0 = handle_open + fn * 0.05 + UP * 0.02
-        reach(push0, -fn, int(1.0 * F), "Closing the drawer", chest_cam, held=True, ride=False)
-        reach(lambda s: push0 - fn * (open_m * s), -fn, int(1.3 * F), "Closing the drawer", chest_cam,
-              held=True, ride=False, extra=lambda s: drawer.set(open_q + (drawer.lo - open_q) * s), key="drawer_closed")
-        # carry pose
-        reach(rb.pos + rb.forward() * 0.45 + UP * 0.85, rb.forward(), int(1.0 * F), "Carry pose", chest_cam,
+        # 4. close the drawer: push the front panel with the held can's side
+        CLOSE_OK = [("held_can|" + HAND, r"^drawer$")]
+        push0 = handle_open + fn * (can_r + 0.02) + UP * (0.03 + grasp_dz)
+        reach(push0, -UP, int(1.0 * F), "Closing the drawer", chest_cam, held=True, ride=False)
+        reach(lambda s_: push0 - fn * ((open_m + 0.02) * s_), -UP, int(1.4 * F), "Closing the drawer", chest_cam,
+              held=True, ride=False, allow=CLOSE_OK,
+              extra=lambda s_: drawer.set(open_q + (drawer.lo - open_q) * min(1.0, s_ * (open_m + 0.02) / open_m)),
+              key="drawer_closed")
+        # carry pose (can upright)
+        reach(rb.pos + rb.forward() * 0.40 + UP * 0.95, -UP, int(1.0 * F), "Carry pose", chest_cam,
               held=True, ride=False)
         # 5. carry to the kitchen
         st["focus"] = {}
@@ -902,21 +1246,23 @@ def main():
         table_cam = lambda: shot(place_pt, -tdir * 1.5 + tside * 1.4 + UP * 1.0, tgt_off=-UP * 0.05)
         st["focus"] = {"place_target": place_pt, "object": lambda: can.translation}
         turn(tyaw, held=True, ride=False, cam=table_cam)
-        # 6. place on the table, release, let physics settle
-        above_t = place_pt + UP * (can_h / 2 + 0.12)
-        reach(above_t, -UP, int(1.4 * F), "Placing on the kitchen table", table_cam, held=True, ride=False, key="over_table")
-        reach(place_pt + UP * (can_c + 0.01), -UP, int(0.8 * F), "Placing on the kitchen table", table_cam,
-              held=True, ride=False)
+        # 6. place: over the spot, straight down, release, retreat
+        place_tip = place_pt + UP * (can_c + 0.004 + grasp_dz)
+        reach(place_tip + UP * 0.14, -UP, int(1.4 * F), "Placing on the kitchen table", table_cam,
+              held=True, ride=False, key="over_table")
+        reach(place_tip, -UP, int(0.9 * F), "Placing on the kitchen table", table_cam, held=True, ride=False,
+              allow=[("held_can", r"^table$")])
+        col.held = False
         can.motion_type = habitat_sim.physics.MotionType.DYNAMIC
         try:
             can.linear_velocity = mn.Vector3(0, 0, 0); can.angular_velocity = mn.Vector3(0, 0, 0)
         except Exception:
             pass
-        reach(rb.tip(), -UP, int(0.4 * F), "Releasing (object settles under Bullet physics)", table_cam,
-              ride=False, fingers=0.045)
-        reach(rb.tip() + UP * 0.2, -UP, int(0.8 * F), "Releasing (object settles under Bullet physics)", table_cam,
-              ride=False, key="placed")
-        reach(rb.pos + rb.forward() * 0.35 + UP * 0.8, rb.forward(), int(1.0 * F), "Done", table_cam, ride=False)
+        reach(place_tip, -UP, int(0.45 * F), "Releasing (object settles under Bullet physics)", table_cam,
+              ride=False, fingers=0.045, allow=[(HAND, r"^can$")])
+        reach(place_tip + UP * 0.16, -UP, int(0.8 * F), "Releasing (object settles under Bullet physics)",
+              table_cam, ride=False, allow=[(HAND, r"^can$")], key="placed")
+        reach(rb.pos + rb.forward() * 0.35 + UP * 1.0, -UP, int(1.0 * F), "Done", table_cam, ride=False)
         # 7. outro orbit
         st["caption"] = "Task complete"
         for k in range(int(3.0 * F)):
@@ -939,7 +1285,10 @@ def main():
         render_s=round(time.time() - t_start, 1),
         ik_p95_cm_by_phase={k: round(100 * float(np.percentile(v, 95)), 1) for k, v in st.get("ik_phase", {}).items()},
         hand_depth_valid_frac=round(float(np.mean(st.get("hand_valid", [0]))), 3),
-        plan_err_cm=st.get("plan_err", {}),
+        collision_frames=st.get("coll_frames", 0),
+        collisions_by_phase=st.get("coll_by_phase", {}),
+        planner={k: v for k, v in st_col.items() if k != "can_rel"},
+        collision_queries=col.n, collision_query_s=round(col.t, 1),
         focus_visible_frac={k: round(a / max(1, b), 3) for k, (a, b) in st.get("focus_stats", {}).items()},
     )
     if not args.selftest and table is not None:
@@ -952,6 +1301,8 @@ def main():
             warn("object did not end on the table top")
     if checks["robot_visible_frac"] < 0.8:
         warn(f"robot visible in only {checks['robot_visible_frac']*100:.0f}% of frames")
+    if checks["collision_frames"]:
+        warn(f"unplanned contacts in {checks['collision_frames']} frames: {checks['collisions_by_phase']}")
     for k, v in checks["focus_visible_frac"].items():
         if v < 0.7:
             warn(f"{k} visible in only {v*100:.0f}% of its shot frames")
