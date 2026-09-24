@@ -1143,7 +1143,7 @@ def main():
             newp = p0 + delta * smooth(k / n)
             rb.spin_wheels((newp - rb.pos).length() * (1 if mn.math.dot(newp - rb.pos, rb.forward()) >= 0 else -1))
             rb.pos = newp
-            st["ik_err"].append(rb.ik(hand, axis=a0, fin=f0, iters=30))
+            st["ik_err"].append(rb.ik(hand, axis=a0, fin=f0, iters=80))
             cam()
             frame(held=held, drawer_ride=ride)
 
@@ -1257,7 +1257,7 @@ def main():
         # 4. close the drawer: push the front panel with the held can's side
         CLOSE_OK = [("held_can|" + HAND, r"^drawer$")]
         gap0, stop = 0.02, 0.013            # can starts 2 cm off the panel; palm stops 1.3 cm short of the chest
-        push0 = handle_open + fn * (can_r + gap0) + UP * (0.03 + grasp_dz)
+        push0 = handle_open + fn * (can_r + gap0) + UP * (0.06 + grasp_dz)
         D = gap0 + open_m - stop
         reach(push0, -UP, int(1.0 * F), "Closing the drawer", chest_cam, held=True, ride=False)
 
