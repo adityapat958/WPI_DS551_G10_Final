@@ -74,7 +74,8 @@ def make_sim(w, h, pip):
 
 
 CLUTTER = ["frl_apartment_bike_01", "frl_apartment_bike_02", "frl_apartment_table_01",
-           "frl_apartment_monitor", "frl_apartment_setupbox", "frl_apartment_camera_02"]
+           "frl_apartment_monitor", "frl_apartment_setupbox", "frl_apartment_camera_02",
+           "frl_apartment_cloth_01", "frl_apartment_cloth_02", "frl_apartment_cloth_03"]
 
 
 def declutter(sim, names):
@@ -240,6 +241,17 @@ class Collider:
     def __init__(self, sim, rb, drawer, table):
         self.sim, self.rb, self.drawer, self.table = sim, rb, drawer, table
         self.rom = sim.get_rigid_object_manager()
+        self.ao_names = {}
+        aom = sim.get_articulated_object_manager()
+        for h in aom.get_object_handles():
+            ao = aom.get_object_by_handle(h)
+            nm = "ao:" + h.split("/")[-1].split(":")[0].rstrip("_")
+            self.ao_names[ao.object_id] = nm
+            for oid in ao.link_object_ids.keys():
+                self.ao_names[oid] = nm
+        self.rom_ids = set()
+        for h in self.rom.get_object_handles():
+            self.rom_ids.add(self.rom.get_object_by_handle(h).object_id)
         chest = drawer.ao
         self.chest_oids = set(drawer.ids)
         self.drawer_oids = {oid for oid, l in chest.link_object_ids.items() if l == drawer.lid}
@@ -266,6 +278,10 @@ class Collider:
             return "table"
         if oid < 0:
             return "stage"
+        if oid in self.ao_names:
+            return self.ao_names[oid]
+        if oid not in self.rom_ids and oid != getattr(self.can, "object_id", None):
+            return f"id{oid}"
         try:
             return "obj:" + self.rom.get_object_by_id(oid).handle.split("/")[-1].split(":")[0].rstrip("_")
         except Exception:
@@ -660,7 +676,10 @@ def main():
         for wi, wp in enumerate(waypts):
             rb.q = q.copy(); rb.apply()
             p0 = rb.tip(); L = (V(wp) - p0).length()
-            n_ = max(2, int(math.ceil(L / step)))
+            ang = 0.0
+            if wi == 0 and axis is not None:
+                ang = math.acos(max(-1.0, min(1.0, float(mn.math.dot(a0.normalized(), V(axis).normalized())))))
+            n_ = max(2, int(math.ceil(L / step)), int(math.ceil(ang / 0.06)))
             for k in range(1, n_ + 1):
                 s_ = k / n_
                 ax = nlerp(a0, V(axis), s_) if (wi == 0 and axis is not None) else axis
@@ -668,7 +687,7 @@ def main():
                 rb.q = q.copy()
                 e = rb.ik(p0 + (V(wp) - p0) * s_, axis=ax, fin=fi, iters=25)
                 qn = rb.q.copy()
-                if e > 0.015 or np.max(np.abs(qn[rb.ik_idx] - q[rb.ik_idx])) > 0.35:
+                if e > 0.015 or np.max(np.abs(qn[rb.ik_idx] - q[rb.ik_idx])) > 0.5:
                     return None
                 if collisions(qn, allow):
                     return None
@@ -682,7 +701,7 @@ def main():
                 return False
         return True
 
-    def rrt_connect(q0, qg, allow, iters=1500, step=0.15):
+    def rrt_connect(q0, qg, allow, iters=4000, step=0.15):
         idx = rb.ik_idx
         lo_ = np.clip(rb.lo, -math.pi, math.pi); hi_ = np.clip(rb.hi, -math.pi, math.pi)
         Ta, Pa, Tb, Pb = [q0.copy()], [-1], [qg.copy()], [-1]
@@ -698,6 +717,8 @@ def main():
 
         for it in range(iters):
             r_ = q0.copy(); r_[idx] = np.random.uniform(lo_[idx], hi_[idx])
+            if np.random.rand() < 0.1:
+                r_ = Tb[0].copy()
             ia = extend(Ta, Pa, r_)
             if ia is not None:
                 while True:
@@ -732,11 +753,13 @@ def main():
         pre = T - V(axis) * 0.13 if axis is not None else T + UP * 0.13
         p0 = rb.tip(); fwd = rb.forward()
         home = rb.pos + fwd * 0.35 + UP * 1.10
+        high = rb.pos + fwd * 0.45 + UP * max(1.35, float(T[1] - rb.pos[1]) + 0.25)
         start_bad = collisions(q0, allow)
         if start_bad:
             warn(f"'{tag}' starts in contact: {sorted(start_bad)}")
         for kind, w in (("cart", [T]), ("via", [pre, T]), ("via", [p0 + UP * 0.12, pre, T]),
-                        ("via", [p0 - fwd * 0.15 + UP * 0.08, pre, T]), ("via", [home, pre, T])):
+                        ("via", [p0 - fwd * 0.15 + UP * 0.08, pre, T]), ("via", [home, pre, T]),
+                        ("via", [p0 - fwd * 0.12, high, pre, T]), ("via", [high, pre, T])):
             qs = cart_path(q0, w, axis, fin, allow)
             if qs is not None:
                 st_col[kind] += 1
