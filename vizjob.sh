@@ -13,7 +13,7 @@ _VJ_EXCL=gpu-6-01,gpu-6-02,gpu-6-03,gpu-6-04,gpu-6-05,gpu-6-06,gpu-6-07,gpu-6-08
 _vj_gpu() {  # _vj_gpu MINUTES CMD...
   local mins="$1"; shift
   export PATH=/cm/shared/apps/slurm/current/bin:$PATH
-  srun --partition=short,quick --gres=gpu:1 --exclude="$_VJ_EXCL" --cpus-per-task=4 --mem=24G \
+  srun --partition=short,quick,long --gres=gpu:1 --exclude="$_VJ_EXCL" --cpus-per-task=4 --mem=24G \
        --time="00:${mins}:00" --job-name=hab_v3 --export=ALL \
        bash -lc "source ~/miniconda3/etc/profile.d/conda.sh && conda activate /scratch/apatwardhan/envs/habitat && \
                  export LD_LIBRARY_PATH=\$CONDA_PREFIX/lib:\$LD_LIBRARY_PATH MAGNUM_LOG=quiet HABITAT_SIM_LOG=quiet && \
