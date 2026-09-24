@@ -89,7 +89,7 @@ def declutter(sim, names):
     return gone
 
 
-def rebuild_navmesh(sim, radius=0.3, height=1.5):
+def rebuild_navmesh(sim, radius=0.38, height=1.5):
     """recompute the navmesh with all furniture treated as obstacles."""
     rom = sim.get_rigid_object_manager(); aom = sim.get_articulated_object_manager()
     saved = []
@@ -322,6 +322,10 @@ class Collider:
             if me in self.BASE_LINKS and (pa is None or pa[1] < 0.10):
                 continue  # wheels / base on the floor or rugs
             k = (me, other)
+            if other.startswith("id") and k not in out:
+                pb = getattr(c, "position_on_b_in_ws", None)
+                if pb is not None:
+                    self.unk_pos = [round(float(x), 2) for x in pb]
             out[k] = max(out.get(k, 0.0), -float(c.contact_distance))
         self.n += 1
         self.t += time.time() - t0
@@ -1231,8 +1235,8 @@ def main():
               key="drawer_open")
         arm_phase["pull_travel_m"] = float(np.linalg.norm(npv(rb.tip()) - gp0))
         handle_open = handle0 + fn * open_m
-        reach(handle_open + fn * 0.12, -fn, int(0.6 * F), "Releasing the handle", chest_cam, fingers=0.045,
-              fin=UP, allow=HANDLE_OK)
+        reach(handle_open + fn * 0.05 + UP * 0.08, -fn, int(0.7 * F), "Releasing the handle", chest_cam,
+              fingers=0.045, fin=UP, allow=HANDLE_OK)
         # 3. drive in for the in-drawer grasp
         base_shift(-fn * 0.13, int(0.9 * F), "Moving closer to the open drawer", chest_cam)
         grasp_t = lambda: can.translation + UP * grasp_dz
@@ -1252,12 +1256,18 @@ def main():
         base_shift(fn * 0.13, int(0.9 * F), "Backing up", chest_cam, held=True, ride=False)
         # 4. close the drawer: push the front panel with the held can's side
         CLOSE_OK = [("held_can|" + HAND, r"^drawer$")]
-        push0 = handle_open + fn * (can_r + 0.02) + UP * (0.03 + grasp_dz)
+        gap0, stop = 0.02, 0.013            # can starts 2 cm off the panel; palm stops 1.3 cm short of the chest
+        push0 = handle_open + fn * (can_r + gap0) + UP * (0.03 + grasp_dz)
+        D = gap0 + open_m - stop
         reach(push0, -UP, int(1.0 * F), "Closing the drawer", chest_cam, held=True, ride=False)
-        reach(lambda s_: push0 - fn * ((open_m + 0.02) * s_), -UP, int(1.4 * F), "Closing the drawer", chest_cam,
-              held=True, ride=False, allow=CLOSE_OK,
-              extra=lambda s_: drawer.set(open_q + (drawer.lo - open_q) * min(1.0, s_ * (open_m + 0.02) / open_m)),
-              key="drawer_closed")
+
+        def close_follow(s_):
+            disp = D * s_
+            frac = min(1.0, max(0.0, (disp - gap0) / (open_m - stop)))
+            drawer.set(open_q + (drawer.lo - open_q) * frac)
+
+        reach(lambda s_: push0 - fn * (D * s_), -UP, int(1.4 * F), "Closing the drawer", chest_cam,
+              held=True, ride=False, allow=CLOSE_OK, extra=close_follow, key="drawer_closed")
         # carry pose (can upright)
         reach(rb.pos + rb.forward() * 0.40 + UP * 0.95, -UP, int(1.0 * F), "Carry pose", chest_cam,
               held=True, ride=False)
@@ -1311,6 +1321,7 @@ def main():
         collision_frames=st.get("coll_frames", 0),
         collisions_by_phase=st.get("coll_by_phase", {}),
         planner={k: v for k, v in st_col.items() if k != "can_rel"},
+        unknown_contact_pos=getattr(col, "unk_pos", None),
         collision_queries=col.n, collision_query_s=round(col.t, 1),
         focus_visible_frac={k: round(a / max(1, b), 3) for k, (a, b) in st.get("focus_stats", {}).items()},
     )
