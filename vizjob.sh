@@ -28,7 +28,7 @@ job_final()    { _vj_gpu 59 python src/demo/render_v3.py --width 1920 --height 1
 job_rl() {
   _vj_gpu 59 python src/rl_skills/rollout_skills.py --models-dir data/models --split val \
       --num-episodes ${RL_EPS:-12} --out-dir videos/rl_skills "$@" \
-    && python - <<'PY'
+    && python3 - <<'PY'
 import glob, os, sys
 sys.path.insert(0, os.environ.get("VIZJOB_LIB", os.path.expanduser("~/.vizjob/lib")))
 import vizjob_hook as vj
