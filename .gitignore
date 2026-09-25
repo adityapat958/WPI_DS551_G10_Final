@@ -18,3 +18,9 @@ __pycache__/
 *.egg
 dist/
 build/
+# render scratch
+videos_turing/
+videos/v3/
+videos/final/
+.vizjob/
+*.checks.json
