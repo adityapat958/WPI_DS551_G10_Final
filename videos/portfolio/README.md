@@ -3,7 +3,7 @@
 | Video | What it shows |
 |---|---|
 | `fetch_bedroom_to_kitchen_1080p.mp4` | 1920×1080, 52 s — drawer → kitchen table, planned whole-body motion |
-| `fetch_learned_skills_720p.mp4` | 1280×720 — learned PPO skills chaining nav → pick → nav → place on 4 validation episodes |
+| `fetch_learned_skills_720p.mp4` | 1280×720, 76 s — learned PPO skills chaining nav → pick → nav → place on 4 validation episodes |
 
 ## 1. Bedroom drawer → kitchen table
 
@@ -38,9 +38,13 @@ vizjob run final      # 1080p
 Meta's Habitat 2022 Rearrangement Challenge skill policies (DD-PPO; the policies see head depth plus
 proprioception) loaded into habitat-lab 0.3.3 and chained nav → pick → nav → place with no hand-written motion.
 The overlay shows the active skill, object-to-goal distance, and the depth image the policy acts on.
-The four clips are the full-task successes from a 60-episode `rearrange_easy` validation batch (4/60).
+The four clips (episodes 5, 50, 237, 373) are full-task successes from a 60-episode `rearrange_easy` validation
+batch; the 2022 skills complete the whole 4-skill chain in roughly 4–7 of 60 episodes (robot start poses are
+sampled per reset, so the successful set varies slightly between runs).
+
+![keyframes](fetch_learned_skills_sheet.jpg)
 
 ```bash
-vizjob run rl -- --episode-ids 5 114 125 318 --pretty --third-w 1280 --third-h 720 --out-dir videos/rl_pretty
-python3 src/rl_skills/make_reel.py videos/rl_pretty/ep{5,114,125,318}_SUCC.mp4 -o videos/portfolio/fetch_learned_skills_720p.mp4
+vizjob run rl -- --num-episodes 60 --only-succ --pretty --third-w 1280 --third-h 720 --out-dir videos/rl_pretty
+python3 src/rl_skills/make_reel.py videos/rl_pretty/ep{5,50,237,373}_SUCC.mp4 -o videos/portfolio/fetch_learned_skills_720p.mp4
 ```

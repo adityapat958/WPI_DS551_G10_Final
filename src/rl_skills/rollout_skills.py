@@ -256,6 +256,7 @@ def main():
     ap.add_argument("--third-res", type=int, default=512)
     ap.add_argument("--third-w", type=int, default=0)
     ap.add_argument("--third-h", type=int, default=0)
+    ap.add_argument("--only-succ", action="store_true", help="write videos only for successful episodes")
     ap.add_argument("--pretty", action="store_true", help="Roboto portfolio overlay (src/rl_skills/overlay.py)")
     ap.add_argument("--gpu-id", type=int, default=0)
     ap.add_argument("--device", default="cuda")
@@ -302,7 +303,8 @@ def main():
             n_succ += succ
             print(f"episode {ep_id}: pddl_success={succ} metrics="
                   f"{ {k: v for k, v in m.items() if isinstance(v, (int, float, bool))} } ({time.time() - t0:.0f}s)")
-            write_video(frames, os.path.join(args.out_dir, f"ep{ep_id}_{'SUCC' if succ else 'fail'}.mp4"), args.fps)
+            if succ or not args.only_succ:
+                write_video(frames, os.path.join(args.out_dir, f"ep{ep_id}_{'SUCC' if succ else 'fail'}.mp4"), args.fps)
             if succ and args.until_success:
                 break
         print(f"success {n_succ}/{i + 1}")
