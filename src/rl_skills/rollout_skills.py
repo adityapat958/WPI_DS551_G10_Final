@@ -25,6 +25,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from load_skill import SkillRunner  # noqa: E402
+from overlay import Overlay, depth_vis  # noqa: E402
 from obs_adapter import (  # noqa: E402
     K_HOLD,
     MAX_SKILL_STEPS,
@@ -88,7 +89,8 @@ def make_config(args):
         agent.sim_sensors.update(
             {
                 "head_rgb_sensor": HeadRGBSensorConfig(height=args.head_res, width=args.head_res),
-                "third_rgb_sensor": ThirdRGBSensorConfig(height=args.third_res, width=args.third_res),
+                "third_rgb_sensor": ThirdRGBSensorConfig(height=args.third_h or args.third_res,
+                                                          width=args.third_w or args.third_res),
             }
         )
     return cfg
@@ -168,6 +170,7 @@ def run_episode(env, runners: Dict[str, SkillRunner], args):
     assert not missing, f"missing v0.3.3 obs keys {missing}; got {list(obs.keys())}"
     frames, log = [], []
     t_total = 0
+    pretty = Overlay(args.third_h or args.third_res) if args.pretty else None
     for stage, (skill, kw) in enumerate(PLAN):
         runner = runners[skill]
         runner.reset()
@@ -188,7 +191,10 @@ def run_episode(env, runners: Dict[str, SkillRunner], args):
             n += 1
             t_total += 1
             m = env.get_metrics()
-            if t_total % args.frame_every == 0:
+            if t_total % args.frame_every == 0 and pretty is not None:
+                frames.append(pretty(obs["third_rgb"], to_uint8_rgb(obs["head_rgb"]), depth_vis(obs["head_depth"]),
+                                     stage, set(range(stage)), bool(obs[K_HOLD][0] > 0.5), _obj_goal_dist(m)))
+            elif t_total % args.frame_every == 0:
                 frames.append(
                     compose_frame(
                         obs,
@@ -215,11 +221,21 @@ def run_episode(env, runners: Dict[str, SkillRunner], args):
         if skill == "pick" and not info["holding"] and args.stop_on_fail:
             break
     # a short tail so the final state is visible
-    for _ in range(args.tail_frames):
+    m = env.get_metrics()
+    succ = bool(m.get("pddl_success", 0.0))
+    for _ in range(args.tail_frames if pretty is None else max(args.tail_frames, 60)):
         if env.episode_over:
-            break
-        obs = env.step(action_to_v033("place", np.zeros(8, np.float32), bool(obs[K_HOLD][0] > 0.5)))
-        frames.append(compose_frame(obs, [f"ep {ep.episode_id}  done"], args.third_res))
+            if pretty is None:
+                break
+        else:
+            obs = env.step(action_to_v033("place", np.zeros(8, np.float32), bool(obs[K_HOLD][0] > 0.5)))
+        if pretty is not None:
+            frames.append(pretty(obs["third_rgb"], to_uint8_rgb(obs["head_rgb"]), depth_vis(obs["head_depth"]),
+                                 3, set(range(4)) if succ else set(range(stage)), bool(obs[K_HOLD][0] > 0.5),
+                                 _obj_goal_dist(env.get_metrics()),
+                                 caption="Task complete" if succ else "Task failed", finished=succ))
+        else:
+            frames.append(compose_frame(obs, [f"ep {ep.episode_id}  done"], args.third_res))
     m = env.get_metrics()
     return frames, log, m
 
@@ -238,6 +254,9 @@ def main():
     ap.add_argument("--tail-frames", type=int, default=30)
     ap.add_argument("--head-res", type=int, default=256)
     ap.add_argument("--third-res", type=int, default=512)
+    ap.add_argument("--third-w", type=int, default=0)
+    ap.add_argument("--third-h", type=int, default=0)
+    ap.add_argument("--pretty", action="store_true", help="Roboto portfolio overlay (src/rl_skills/overlay.py)")
     ap.add_argument("--gpu-id", type=int, default=0)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--stochastic", action="store_true")

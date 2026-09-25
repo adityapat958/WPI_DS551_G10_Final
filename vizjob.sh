@@ -5,7 +5,7 @@ VJ_HOST=turing.wpi.edu
 VJ_DIR=/scratch/apatwardhan/habitat_ws/WPI_DS551_G10_Final
 
 # push code only (data/ + models/ already live on the host)
-vj_sync() { rsync -a -e ssh ./src/demo/ "$VJ_HOST:$VJ_DIR/src/demo/"; }
+vj_sync() { rsync -a -e ssh ./src/demo/ "$VJ_HOST:$VJ_DIR/src/demo/"; rsync -a -e ssh --exclude=__pycache__ ./src/rl_skills/ "$VJ_HOST:$VJ_DIR/src/rl_skills/"; }
 
 # RTX PRO 6000 Blackwell nodes hang habitat-sim's EGL init -> never schedule there
 _VJ_EXCL=gpu-6-01,gpu-6-02,gpu-6-03,gpu-6-04,gpu-6-05,gpu-6-06,gpu-6-07,gpu-6-08,gpu-6-09,gpu-6-10,gpu-6-11,gpu-6-12,gpu-6-13,gpu-6-14,gpu-6-15,gpu-6-16,gpu-6-17,gpu-6-18,gpu-6-19,gpu-6-20

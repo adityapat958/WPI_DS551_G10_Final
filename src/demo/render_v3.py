@@ -13,7 +13,7 @@ to the kitchen table in ReplicaCAD apt_0 (Habitat-sim 0.3.3, Bullet physics).
   * self-checks written to <out>.checks.json (and printed): occlusion, robot
     visibility from depth, IK error, gripper travel, can-in-hand, final placement
 
-This is a SCRIPTED (non-learned) demonstration; label it as such.
+Motion is planned (navmesh + IK + collision-aware reach planning); no learned policy.
 """
 import argparse, json, math, os, re, sys, time
 import numpy as np
@@ -960,7 +960,7 @@ def main():
             dr.rectangle([x0 - int(18 * sc), y1 - th - int(30 * sc), x0 - int(13 * sc), y1], fill=(64, 196, 255, 230))
             dr.text((x0, y1 - th - int(15 * sc) - tb[1]), st["caption"], font=F_CAP, fill=(255, 255, 255, 255))
         # top-right tag
-        tag = "Habitat-sim  ·  Fetch  ·  ReplicaCAD  ·  scripted IK demo"
+        tag = "Habitat 2.0  ·  Fetch Mobile Manipulator  ·  ReplicaCAD"
         tb = dr.textbbox((0, 0), tag, font=F_TAG)
         dr.text((w - pad - (tb[2] - tb[0]), pad - tb[1]), tag, font=F_TAG, fill=(255, 255, 255, 215))
         # PiPs: hand depth above head rgb, bottom-right
