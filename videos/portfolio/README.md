@@ -1,38 +1,28 @@
-# Fetch Rearrange Demo — Portfolio Visualization
+# Fetch: bedroom drawer → kitchen table (Habitat-sim, ReplicaCAD apt_0)
 
-A scripted Habitat 2.0 visualization: the **Fetch** mobile manipulator navigates a
-**ReplicaCAD** apartment (`apt_0`), **opens a drawer** of the chest-of-drawers, and
-**picks up** a YCB object (master chef can).
+![keyframes](fetch_bedroom_to_kitchen_sheet.jpg)
 
-![contact sheet](fetch_rearrange_contact_sheet.png)
+`fetch_bedroom_to_kitchen_1080p.mp4` — 1920×1080, 30 fps, 52 s. **Scripted (non-learned) demo.**
 
-- `fetch_rearrange_demo.mp4` — 1280×720, 30 fps, 6 s (nav → open drawer → reach → lift)
-- `fetch_rearrange_contact_sheet.png` — 12-frame overview
+The Fetch mobile manipulator navigates the apartment, opens a chest-of-drawers by its handle,
+picks a soup can out of the drawer, closes the drawer, carries the can upright to the kitchen table,
+and places it; the can settles under Bullet physics.
 
-## How it was made
+## How it works (`src/demo/render_v3.py`)
+- **Navigation** — shortest paths on a navmesh recomputed after decluttering (clearance 0.38 m).
+- **Arm** — damped-least-squares IK (torso + 7 arm joints) on the simulator's own forward kinematics,
+  with approach-axis and finger-axis constraints (side-straddle grasps).
+- **Collision-free motion planning** — Bullet contact queries on every robot link and the held object;
+  each reach tries a straight Cartesian path, then via-points, then RRT-Connect in joint space with shortcut smoothing.
+- **Per-frame collision audit** — every rendered frame is checked; the final render has **0 unplanned contacts**.
+- **Placement** — candidate spots are filtered for a clear table surface and a collision-free reach
+  (final error 0.9 cm, 0.7° tilt).
+- **Camera** — GTA-style chase camera with raycast wall avoidance; PiPs show the hand depth camera
+  (mounted where habitat-lab defines Fetch's arm camera) and the head RGB camera.
+- Self-check report: `videos/v3/*.checks.json`.
 
-Pure `habitat_sim` (v0.3.3, headless EGL) — no RL policy required. Motion is scripted
-kinematically for a clean, deterministic portfolio reel:
-
-1. **Navigate** — Fetch base interpolates to a standoff in front of the chest.
-2. **Open drawer** — the target drawer joint (`drawer_topR`) is animated; the opening
-   direction is auto-detected in world space by nudging the joint and measuring the link delta.
-3. **Reach** — the arm poses via named Fetch joints (`torso_lift`, `shoulder_lift`,
-   `elbow_flex`, `wrist_flex`) resolved through `get_link_joint_pos_offset`.
-4. **Lift** — the object tracks the `gripper_link` and is retrieved.
-
-## Reproduce (on a GPU node, headless EGL habitat-sim)
-
+## Reproduce
 ```bash
-# introspect robot/drawer joint indices
-python src/demo/render_rearrange_demo.py --inspect --scene apt_0
-
-# render
-python src/demo/render_rearrange_demo.py --scene apt_0 \
-    --out videos/portfolio/fetch_rearrange_demo.mp4 --width 1280 --height 720 --fps 30
+vizjob run render     # 720p   (see vizjob.sh; WPI Turing, env /scratch/apatwardhan/envs/habitat)
+vizjob run final      # 1080p
 ```
-
-Tunable knobs: `--drawer-link`, `--open-amt`, `--stand-dist`, `--cam-dist`.
-
-On WPI Turing: `sbatch src/demo/run_turing_gpu.sh` (env `habitat`, A100/L40S/H100/H200 — not
-the Blackwell RTX PRO 6000, which hangs on import).
