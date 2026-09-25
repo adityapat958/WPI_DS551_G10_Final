@@ -23,3 +23,19 @@ _vj_gpu() {  # _vj_gpu MINUTES CMD...
 job_selftest() { _vj_gpu 15 python src/demo/render_v3.py --selftest --out videos/v3/selftest.mp4 "$@"; }
 job_render()   { _vj_gpu 40 python src/demo/render_v3.py --out videos/v3/fetch_bedroom_to_kitchen.mp4 "$@"; }
 job_final()    { _vj_gpu 59 python src/demo/render_v3.py --width 1920 --height 1080 --out videos/v3/fetch_bedroom_to_kitchen_1080p.mp4 "$@"; }
+
+# pretrained 2022 challenge skills (nav->pick->nav->place) on rearrange_easy val episodes
+job_rl() {
+  _vj_gpu 59 python src/rl_skills/rollout_skills.py --models-dir data/models --split val \
+      --num-episodes ${RL_EPS:-12} --out-dir videos/rl_skills "$@" \
+    && python - <<'PY'
+import glob, os, sys
+sys.path.insert(0, os.environ.get("VIZJOB_LIB", os.path.expanduser("~/.vizjob/lib")))
+import vizjob_hook as vj
+v = sorted(glob.glob("videos/rl_skills/*.mp4"))
+succ = [p for p in v if "SUCC" in p]
+vj.post_text(f"RL skills: {len(succ)}/{len(v)} episodes succeeded")
+for p in (succ or v)[:3]:
+    vj.post_image(p, "2022 pretrained skills | " + os.path.basename(p))
+PY
+}
